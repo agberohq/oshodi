@@ -2,6 +2,7 @@
 package metrics
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -45,7 +46,7 @@ func TestCountMinSketchMultipleKeys(t *testing.T) {
 
 	keys := make([][]byte, 10)
 	for i := 0; i < 10; i++ {
-		keys[i] = []byte("key" + string(rune(i)))
+		keys[i] = []byte("key" + strconv.Itoa(i))
 	}
 
 	// Add each key multiple times

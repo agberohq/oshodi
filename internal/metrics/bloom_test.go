@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -61,7 +62,7 @@ func TestBloomFilterEstimatedFPR(t *testing.T) {
 
 	// Add many keys
 	for i := 0; i < 100000; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		bf.Add(key)
 	}
 
@@ -97,7 +98,7 @@ func TestBloomFilterFalsePositiveRate(t *testing.T) {
 
 	// Add some keys
 	for i := 0; i < 500; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		bf.Add(key)
 	}
 
@@ -105,7 +106,7 @@ func TestBloomFilterFalsePositiveRate(t *testing.T) {
 	falsePositives := 0
 	tests := 10000
 	for i := 500; i < 500+tests; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		if bf.MaybeHas(key) {
 			falsePositives++
 		}

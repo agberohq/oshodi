@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestHyperLogLogEstimate(t *testing.T) {
 
 	// Add unique keys
 	for i := 0; i < 1000; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		hll.Add(key)
 	}
 
@@ -63,12 +64,12 @@ func TestHyperLogLogMerge(t *testing.T) {
 	hll2 := NewHyperLogLog(14)
 
 	for i := 0; i < 500; i++ {
-		key := []byte("key1-" + string(rune(i)))
+		key := []byte("key1-" + strconv.Itoa(i))
 		hll1.Add(key)
 	}
 
 	for i := 0; i < 500; i++ {
-		key := []byte("key2-" + string(rune(i)))
+		key := []byte("key2-" + strconv.Itoa(i))
 		hll2.Add(key)
 	}
 
@@ -84,7 +85,7 @@ func TestHyperLogLogReset(t *testing.T) {
 	hll := NewHyperLogLog(14)
 
 	for i := 0; i < 100; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		hll.Add(key)
 	}
 
@@ -106,7 +107,7 @@ func TestHyperLogLogPrecision(t *testing.T) {
 	for _, precision := range []uint8{10, 12, 14, 16} {
 		hll := NewHyperLogLog(precision)
 		for i := 0; i < 10000; i++ {
-			key := []byte("key" + string(rune(i)))
+			key := []byte("key" + strconv.Itoa(i))
 			hll.Add(key)
 		}
 		estimate := hll.Estimate()
@@ -129,7 +130,7 @@ func BenchmarkHyperLogLogAdd(b *testing.B) {
 func BenchmarkHyperLogLogEstimate(b *testing.B) {
 	hll := NewHyperLogLog(14)
 	for i := 0; i < 10000; i++ {
-		key := []byte("key" + string(rune(i)))
+		key := []byte("key" + strconv.Itoa(i))
 		hll.Add(key)
 	}
 
