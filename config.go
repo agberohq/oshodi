@@ -50,6 +50,9 @@ type Config struct {
 	JackPool     *jack.Pool
 	JackDoctor   *jack.Doctor
 	JackLifetime *jack.Lifetime
+
+	WALMaxBufSize int
+	DisableWAL    bool
 }
 
 // DefaultConfig returns a config with sensible defaults
@@ -77,5 +80,7 @@ func DefaultConfig() *Config {
 		CardinalityPrecision:    14,
 		EnableFrequency:         true,
 		Logger:                  ll.New("oshodi").Disable().Suspend(),
+		WALMaxBufSize:           4 * 1024 * 1024, // 4MB
+		DisableWAL:              false,
 	}
 }

@@ -172,3 +172,19 @@ func WithLifetime(lifetime *jack.Lifetime) Option {
 		c.JackLifetime = lifetime
 	}
 }
+
+// WithWALBufferSize options.go - Add WAL options:
+func WithWALBufferSize(size int) Option {
+	return func(c *Config) {
+		if size > 0 {
+			c.WALMaxBufSize = size
+		}
+	}
+}
+
+// WithWALDisabled disables the Write-Ahead Log
+func WithWALDisabled(disable bool) Option {
+	return func(c *Config) {
+		c.DisableWAL = disable
+	}
+}
