@@ -1,4 +1,3 @@
-// internal/engine/db_test.go
 package engine
 
 import (
@@ -6,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewDB(t *testing.T) {
@@ -333,10 +333,14 @@ func TestDBCompact(t *testing.T) {
 		t.Fatalf("flush failed: %v", err)
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
 	// Compact
 	if err := db.Compact(); err != nil {
 		t.Fatalf("compact failed: %v", err)
 	}
+
+	time.Sleep(200 * time.Millisecond)
 
 	// Verify remaining keys exist
 	for i := 50; i < 100; i++ {

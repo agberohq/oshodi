@@ -22,9 +22,10 @@ var (
 
 // File manages file operations with mmap support and optional compression.
 type File struct {
-	file *os.File
-	mmap atomic.Pointer[mmap.ReaderAt]
-	path string
+	file   *os.File
+	mmap   atomic.Pointer[mmap.ReaderAt]
+	mmapMu sync.RWMutex // Protects mmap pointer access during remap/reads
+	path   string
 	// logicalSize: end of written record data (where next write goes)
 	logicalSize atomic.Int64
 	// allocatedSize: actual file size on disk (for Size() API compatibility)
@@ -105,6 +106,9 @@ func NewFile(cfg *FileConfig) (*File, error) {
 
 // remap creates a new mmap reader (must be called with write lock)
 func (f *File) remap() error {
+	f.mmapMu.Lock()
+	defer f.mmapMu.Unlock()
+
 	// Close old mmap
 	if old := f.mmap.Load(); old != nil {
 		old.Close()
@@ -179,18 +183,34 @@ func (f *File) processRetryQueue() {
 	}
 }
 
-// ReadAt reads data at offset - LOCK-FREE path
+// ReadAt reads data at offset - LOCK-FREE path with stale-mmap fallback
 func (f *File) ReadAt(off int64, key []byte) ([]byte, error) {
 	if f.closed.Load() {
 		return nil, ErrClosed
 	}
 
+	f.mmapMu.RLock()
 	reader := f.mmap.Load()
 	if reader == nil {
+		f.mmapMu.RUnlock()
 		return nil, ErrClosed
 	}
-
 	readKey, value, tombstone, _, err := f.readRecord(reader, off)
+	f.mmapMu.RUnlock()
+
+	// Aggressive fallback: any error on valid offset -> try direct file read
+	if err != nil && off >= 0 && off < f.logicalSize.Load() {
+		f.mu.RLock()
+		file := f.file
+		f.mu.RUnlock()
+
+		fbKey, fbValue, fbTombstone, _, fbErr := f.readRecord(file, off)
+		if fbErr == nil {
+			readKey, value, tombstone = fbKey, fbValue, fbTombstone
+			err = nil
+		}
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -350,9 +370,12 @@ func (f *File) Close() error {
 	close(f.stopRetry)
 	f.wg.Wait()
 
+	f.mmapMu.Lock()
 	if mm := f.mmap.Load(); mm != nil {
 		mm.Close()
 	}
+	f.mmapMu.Unlock()
+
 	return f.file.Close()
 }
 
@@ -535,15 +558,18 @@ func (f *File) ReadRecordAt(offset int64) (key, value []byte, tombstone bool, n 
 		return nil, nil, false, 0, ErrClosed
 	}
 
+	f.mmapMu.RLock()
 	reader := f.mmap.Load()
 	if reader == nil {
+		f.mmapMu.RUnlock()
 		return nil, nil, false, 0, ErrClosed
 	}
-
 	key, value, tombstone, n, err = f.readRecord(reader, offset)
+	f.mmapMu.RUnlock()
 
-	// Fallback to direct file read if mmap is stale (eventual consistency)
-	if (err == io.EOF || err == io.ErrUnexpectedEOF) && offset < f.logicalSize.Load() {
+	// Fallback to direct file read if mmap is stale
+	shouldHaveData := offset >= 0 && offset < f.logicalSize.Load()
+	if (err != nil || (tombstone && shouldHaveData)) && shouldHaveData {
 		return f.readRecord(f.file, offset)
 	}
 

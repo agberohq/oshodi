@@ -1,3 +1,4 @@
+// engine/db.go
 package engine
 
 import (
@@ -21,7 +22,6 @@ var (
 	ErrBufferFull  = errors.New("oshodi: write buffer full")
 )
 
-// DBStats holds database statistics.
 type DBStats struct {
 	NumKeys         int
 	FileSizeBytes   int64
@@ -32,38 +32,28 @@ type DBStats struct {
 	EstimatedKeys   uint64
 }
 
-// DB is the core database implementation.
 type DB struct {
-	// RCU (Read-Copy-Update) Pointers for zero-lock reads
-	storage atomic.Pointer[storage.File]
-	index   atomic.Pointer[Index]
-
-	// Sharded Writer handles all concurrent multi-producer writes lock-free
-	writer *ShardedWriter
-
-	cache    *pipeline.Cache
-	pool     *jack.Pool
-	pubsub   *messaging.PubSub
-	handlers *messaging.ReqResp
-	metrics  *metrics.Manager
-	config   *Config
-
+	storage   atomic.Pointer[storage.File]
+	index     atomic.Pointer[Index]
+	writer    *ShardedWriter
+	cache     *pipeline.Cache
+	pool      *jack.Pool
+	pubsub    *messaging.PubSub
+	handlers  *messaging.ReqResp
+	metrics   *metrics.Manager
+	config    *Config
 	stop      chan struct{}
 	compactCh chan struct{}
 	closeOnce sync.Once
 	closed    atomic.Bool
 	wg        sync.WaitGroup
 	logger    *ll.Logger
-
 	compactMu sync.Mutex
-
-	// External Dependencies (Dependency Injection)
-	lifetime *jack.Lifetime
-	doctor   *jack.Doctor
-	ownPool  bool
+	lifetime  *jack.Lifetime
+	doctor    *jack.Doctor
+	ownPool   bool
 }
 
-// Config for core DB
 type Config struct {
 	FilePath                string
 	BloomExpectedItems      uint
@@ -88,16 +78,12 @@ type Config struct {
 	CardinalityPrecision    uint8
 	EnableFrequency         bool
 	SplitMutexShards        int
-
-	// External resources injected by the load balancer
-	JackPool     *jack.Pool
-	JackDoctor   *jack.Doctor
-	JackLifetime *jack.Lifetime
+	JackPool                *jack.Pool
+	JackDoctor              *jack.Doctor
+	JackLifetime            *jack.Lifetime
 }
 
-// NewDB creates a new database.
 func NewDB(config *Config) (*DB, error) {
-	// Apply defaults
 	if config == nil {
 		config = &Config{}
 	}
@@ -137,8 +123,6 @@ func NewDB(config *Config) (*DB, error) {
 	if config.BloomFalsePositiveRate == 0 {
 		config.BloomFalsePositiveRate = 0.01
 	}
-
-	// Setup Dependency Injection Pool
 	var pool *jack.Pool
 	var ownPool bool
 	if config.JackPool != nil {
@@ -148,8 +132,6 @@ func NewDB(config *Config) (*DB, error) {
 		pool = jack.NewPool(config.PoolSize)
 		ownPool = true
 	}
-
-	// Setup compressor
 	var compressor *storage.Compressor
 	if config.EnableCompression {
 		var err error
@@ -158,17 +140,15 @@ func NewDB(config *Config) (*DB, error) {
 			return nil, err
 		}
 	}
-
-	// Open storage
-	store, err := storage.NewFile(config.FilePath, config.InitialFileSize, config.WriterBufferSize, compressor)
+	storeCfg := storage.DefaultFileConfig(config.FilePath)
+	storeCfg.InitialSize = config.InitialFileSize
+	storeCfg.BufferSize = config.WriterBufferSize
+	storeCfg.Compressor = compressor
+	store, err := storage.NewFile(storeCfg)
 	if err != nil {
 		return nil, err
 	}
-
-	// Create index
 	idx := NewIndex(config.BloomExpectedItems, config.BloomFalsePositiveRate)
-
-	// Create sharded writer directly tied to the storage
 	writer, err := NewShardedWriter(ShardedWriterConfig{
 		ShardCount: config.SplitMutexShards,
 		BufferSize: config.WriterBufferSize,
@@ -179,15 +159,9 @@ func NewDB(config *Config) (*DB, error) {
 		store.Close()
 		return nil, err
 	}
-
-	// Create Zero-Allocation Cache
 	cache := pipeline.NewCache(config.CacheSize)
-
-	// Create metrics
 	metricsMgr := metrics.NewManager(config.EnableCardinality, config.CardinalityPrecision, config.EnableFrequency)
-	// Bind Bloom filter to metrics manager to track all additions seamlessly
 	metricsMgr.SetBloomFilter(idx.bloom)
-
 	db := &DB{
 		writer:    writer,
 		cache:     cache,
@@ -201,23 +175,16 @@ func NewDB(config *Config) (*DB, error) {
 		doctor:    config.JackDoctor,
 		ownPool:   ownPool,
 	}
-
 	db.storage.Store(store)
 	db.index.Store(idx)
-
-	// Initialize messaging
 	db.pubsub = messaging.NewPubSub(pool, config.Logger, nil)
 	db.handlers = messaging.NewReqResp(5 * time.Second)
-
-	// Load existing data
 	if store.Size() > 0 && !store.IsEmpty() {
 		if err := db.loadIndex(); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-
-	// Register with external Doctor if provided
 	if db.doctor != nil {
 		db.doctor.Add(jack.NewPatient(jack.PatientConfig{
 			ID:       "oshodi.storage",
@@ -225,10 +192,7 @@ func NewDB(config *Config) (*DB, error) {
 			Check:    jack.FuncCtx(db.healthCheck),
 		}))
 	}
-
-	// Route background tasks to Lifetime if provided, otherwise spawn local goroutines
 	if db.lifetime != nil {
-		// Self-rescheduling wrapper for periodic compaction
 		var scheduleCompaction func()
 		scheduleCompaction = func() {
 			if db.closed.Load() {
@@ -238,12 +202,10 @@ func NewDB(config *Config) (*DB, error) {
 				if err := db.CompactIfNeeded(); err != nil {
 					db.logger.Fields("error", err).Error("compaction check failed")
 				}
-				scheduleCompaction() // Schedule the next run
+				scheduleCompaction()
 			}), db.config.CompactionInterval)
 		}
 		scheduleCompaction()
-
-		// Self-rescheduling wrapper for periodic metrics
 		var scheduleMetrics func()
 		scheduleMetrics = func() {
 			if db.closed.Load() {
@@ -258,32 +220,27 @@ func NewDB(config *Config) (*DB, error) {
 					"cache_size", stats.CacheSize,
 					"estimated_keys", stats.EstimatedKeys,
 				).Debug("oshodi metrics")
-				scheduleMetrics() // Schedule the next run
+				scheduleMetrics()
 			}), 1*time.Minute)
 		}
 		scheduleMetrics()
-
 	} else {
 		db.wg.Add(2)
 		go db.processCompaction()
 		go db.metricsReporter()
 	}
-
 	return db, nil
 }
 
-// healthCheck is called by jack.Doctor.
 func (db *DB) healthCheck(ctx context.Context) error {
 	store := db.storage.Load()
 	if store == nil {
 		return errors.New("storage is nil")
 	}
-	// A simple size check verifies the storage pointer is valid and the file handle is responsive.
 	_ = store.Size()
 	return nil
 }
 
-// loadIndex rebuilds the index from the file.
 func (db *DB) loadIndex() error {
 	store := db.storage.Load()
 	idx := db.index.Load()
@@ -304,111 +261,88 @@ func (db *DB) loadIndex() error {
 	return nil
 }
 
-// Set stores a key-value pair, routing it directly to the ShardedWriter without double-buffering.
 func (db *DB) Set(key, value []byte) error {
 	if len(key) == 0 {
 		return errors.New("oshodi: key cannot be empty")
 	}
 	db.metrics.Add(key)
-
-	// Lock-free write to the sharded writer.
-	// The sharded writer handles the async flushing automatically via jack.Pool!
 	offset, err := db.writer.WriteRecord(key, value)
 	if err != nil {
 		return err
 	}
-
-	// Optimistically update the RCU index (readers will find the new data after flush).
 	db.index.Load().Set(key, offset)
 	db.cache.Delete(key)
-
 	return nil
 }
 
-// Get retrieves a value (100% Zero-Lock Hot Path).
 func (db *DB) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrKeyNotFound
 	}
-
-	// Check zero-allocation cache first
 	if val, ok := db.cache.Get(key); ok {
 		return val, nil
 	}
-
-	// Atomic load index (Lock-Free)
 	idx := db.index.Load()
-
-	// Atomic Bloom Filter check
 	if !idx.MaybeHas(key) {
 		return nil, ErrKeyNotFound
 	}
-
 	offset, ok := idx.Get(key)
 	if !ok {
 		return nil, ErrKeyNotFound
 	}
-
-	// Atomic load storage (Lock-Free)
 	store := db.storage.Load()
 	val, err := store.ReadAt(offset, key)
 	if err != nil {
 		return nil, err
 	}
-
 	db.cache.Set(key, val)
 	return val, nil
 }
 
-// Delete queues a tombstone directly to the ShardedWriter.
 func (db *DB) Delete(key []byte) error {
 	if len(key) == 0 {
 		return errors.New("oshodi: key cannot be empty")
 	}
-
 	if err := db.writer.WriteTombstone(key); err != nil {
 		return err
 	}
-
 	db.index.Load().Delete(key)
 	db.cache.Delete(key)
 	return nil
 }
 
-// Flush forces all pending writes to disk via the ShardedWriter.
 func (db *DB) Flush() error {
 	return db.writer.Flush()
 }
 
-// Compact runs full compaction utilizing the RCU pattern.
 func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
-
-	// Flush all pending writes so we don't miss anything
 	if err := db.writer.Flush(); err != nil {
 		return err
 	}
 
-	// Build new storage and index
+	// Hold write lock to prevent writes during swap
+	db.writer.writeMu.Lock()
+	defer db.writer.writeMu.Unlock()
+
 	tmpPath := db.config.FilePath + ".compact"
-
-	// Clean up any old crashed compact files
 	_ = os.Remove(tmpPath)
-
-	tmpStore, err := storage.NewFile(tmpPath, db.config.InitialFileSize, db.config.WriterBufferSize, db.storage.Load().Compressor())
+	tmpStoreCfg := storage.DefaultFileConfig(tmpPath)
+	tmpStoreCfg.InitialSize = db.config.InitialFileSize
+	tmpStoreCfg.BufferSize = db.config.WriterBufferSize
+	tmpStoreCfg.Compressor = db.storage.Load().Compressor()
+	tmpStore, err := storage.NewFile(tmpStoreCfg)
 	if err != nil {
 		return err
 	}
-
 	newIndex := NewIndex(db.config.BloomExpectedItems, db.config.BloomFalsePositiveRate)
 	oldIndex := db.index.Load()
-	var newOffset int64
+	oldStorage := db.storage.Load()
 
-	// Copy live data
+	var newOffset int64
 	oldIndex.Range(func(key []byte, offset int64) bool {
-		store := db.storage.Load()
-		_, value, tombstone, _, err := store.ReadRecordAt(offset)
+		_, value, tombstone, _, err := oldStorage.ReadRecordAt(offset)
 		if err != nil || tombstone {
 			return true
 		}
@@ -417,7 +351,7 @@ func (db *DB) Compact() error {
 			return false
 		}
 		newIndex.Set(key, newOff)
-		newOffset += newOff
+		newOffset = newOff // Track last offset
 		return true
 	})
 
@@ -427,23 +361,15 @@ func (db *DB) Compact() error {
 		return err
 	}
 
-	// Atomic Swap (RCU) - Readers instantly switch to new index and storage
-	oldStorage := db.storage.Load()
-
+	// Update writer store and reset offset to match new file
+	db.writer.store.Store(tmpStore)
+	db.writer.offset.Store(tmpStore.LogicalSize())
 	db.storage.Store(tmpStore)
 	db.index.Store(newIndex)
 
-	// Update the writer to point to the new store so future writes go to the compacted file
-	db.writer.store = tmpStore
-
-	// RCU Grace Period cleanup
 	db.pool.Do(func() {
-		// Wait for existing lock-free readers to finish reading from old mmap
 		time.Sleep(3 * time.Second)
-
 		_ = oldStorage.Close()
-
-		// Cross-platform safety: we remove the original and rename the compacted file.
 		_ = os.Remove(db.config.FilePath)
 		if err := os.Rename(tmpPath, db.config.FilePath); err != nil {
 			db.logger.Fields("error", err).Error("compaction file rename failed")
@@ -451,11 +377,9 @@ func (db *DB) Compact() error {
 			db.logger.Fields("new_size", newOffset, "live_keys", newIndex.Len()).Info("compaction completed gracefully")
 		}
 	})
-
 	return nil
 }
 
-// CompactIfNeeded checks and triggers compaction if fragmentation exceeds threshold.
 func (db *DB) CompactIfNeeded() error {
 	idx := db.index.Load()
 	if idx.Len() < db.config.CompactionMinItems {
@@ -465,7 +389,6 @@ func (db *DB) CompactIfNeeded() error {
 	avgRecordSize := store.Size() / int64(idx.Len())
 	estimatedLive := int64(idx.Len()) * avgRecordSize
 	fragmentation := float64(store.Size()-estimatedLive) / float64(store.Size())
-
 	if fragmentation > db.config.CompactionFragmentation {
 		db.logger.Fields(
 			"fragmentation", fragmentation,
@@ -478,12 +401,10 @@ func (db *DB) CompactIfNeeded() error {
 	return nil
 }
 
-// processCompaction handles background compaction when jack.Lifetime is not available.
 func (db *DB) processCompaction() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.config.CompactionInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-db.compactCh:
@@ -500,12 +421,10 @@ func (db *DB) processCompaction() {
 	}
 }
 
-// metricsReporter logs periodic metrics when jack.Lifetime is not available.
 func (db *DB) metricsReporter() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -523,7 +442,6 @@ func (db *DB) metricsReporter() {
 	}
 }
 
-// Stats returns database statistics as a struct.
 func (db *DB) Stats() DBStats {
 	store := db.storage.Load()
 	idx := db.index.Load()
@@ -538,7 +456,6 @@ func (db *DB) Stats() DBStats {
 	}
 }
 
-// Info returns database statistics as a map (for API compatibility).
 func (db *DB) Info() map[string]interface{} {
 	stats := db.Stats()
 	return map[string]interface{}{
@@ -552,67 +469,54 @@ func (db *DB) Info() map[string]interface{} {
 	}
 }
 
-// Size returns the current logical size.
 func (db *DB) Size() int64 {
 	return db.writer.Offset()
 }
 
-// EstimatedKeyCount returns estimated unique keys.
 func (db *DB) EstimatedKeyCount() uint64 {
 	return db.metrics.EstimatedKeys()
 }
 
-// RegisterHandler registers a request-response handler.
 func (db *DB) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
 	db.handlers.Register(name, messaging.HandlerFunc(fn))
 }
 
-// UnregisterHandler removes a request-response handler.
 func (db *DB) UnregisterHandler(name string) {
 	db.handlers.Unregister(name)
 }
 
-// Call invokes a handler.
 func (db *DB) Call(name string, payload []byte) ([]byte, error) {
 	return db.handlers.Call(name, payload)
 }
 
-// CallDirect invokes a handler directly.
 func (db *DB) CallDirect(name string, payload []byte) ([]byte, error) {
 	return db.handlers.CallDirect(name, payload)
 }
 
-// Subscribe registers a callback.
 func (db *DB) Subscribe(channel string, fn func([]byte)) func() {
 	return db.pubsub.SubscribeSimple("", channel, fn)
 }
 
-// SubscribeWithID registers with ID.
 func (db *DB) SubscribeWithID(channel string, fn func([]byte)) (int64, func()) {
 	return db.pubsub.Subscribe("", channel, fn)
 }
 
-// Publish sends a message.
 func (db *DB) Publish(channel string, payload []byte) (int, error) {
 	return db.pubsub.Publish("", channel, payload)
 }
 
-// UnsubscribeAll removes all subscribers.
 func (db *DB) UnsubscribeAll(channel string) {
 	db.pubsub.UnsubscribeAll("", channel)
 }
 
-// GetSubscriptionCount returns subscriber count.
 func (db *DB) GetSubscriptionCount(channel string) int {
 	return db.pubsub.Count("", channel)
 }
 
-// GetAllSubscriptionIDs returns all subscription IDs.
 func (db *DB) GetAllSubscriptionIDs(channel string) []int64 {
 	return db.pubsub.IDs("", channel)
 }
 
-// GetBucket returns a bucket handle.
 func (db *DB) GetBucket(name string) *Bucket {
 	prefix := make([]byte, 0, len(name)+1)
 	if name != "" {
@@ -626,29 +530,20 @@ func (db *DB) GetBucket(name string) *Bucket {
 	}
 }
 
-// Close gracefully shuts down the database.
 func (db *DB) Close() error {
 	var err error
 	db.closeOnce.Do(func() {
 		db.closed.Store(true)
 		close(db.stop)
-
-		// Wait for workers to finish
 		db.wg.Wait()
-
-		// Final flush
 		if flushErr := db.Flush(); flushErr != nil {
 			err = flushErr
 		}
-
-		// Close storage
 		if store := db.storage.Load(); store != nil {
 			if closeErr := store.Close(); closeErr != nil && err == nil {
 				err = closeErr
 			}
 		}
-
-		// Shutdown pool if we own it
 		if db.ownPool && db.pool != nil {
 			db.pool.Shutdown(30 * time.Second)
 		}
