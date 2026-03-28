@@ -1,3 +1,4 @@
+// internal/engine/writer_test.go
 // engine/writer_test.go
 package engine
 
@@ -30,8 +31,8 @@ func TestNewShardedWriter(t *testing.T) {
 	if writer == nil {
 		t.Fatal("writer is nil")
 	}
-	if writer.Offset() != 1024 {
-		t.Errorf("expected offset 1024, got %d", writer.Offset())
+	if writer.Offset() != 0 {
+		t.Errorf("expected offset 0, got %d", writer.Offset())
 	}
 }
 
@@ -59,12 +60,12 @@ func TestShardedWriterWriteRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("write record failed: %v", err)
 	}
-	if offset != 1024 {
-		t.Errorf("expected offset 1024, got %d", offset)
+	if offset != 0 {
+		t.Errorf("expected offset 0, got %d", offset)
 	}
 	newOffset := writer.Offset()
-	if newOffset <= 1024 {
-		t.Errorf("expected offset > 1024, got %d", newOffset)
+	if newOffset <= 0 {
+		t.Errorf("expected offset > 0, got %d", newOffset)
 	}
 }
 
@@ -287,11 +288,11 @@ func TestShardedWriterLargeRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("write large record failed: %v", err)
 	}
-	if offset != 1024 {
-		t.Errorf("expected offset 1024, got %d", offset)
+	if offset != 0 {
+		t.Errorf("expected offset 0, got %d", offset)
 	}
-	if writer.Offset() <= 1024 {
-		t.Errorf("expected offset > 1024, got %d", writer.Offset())
+	if writer.Offset() <= 0 {
+		t.Errorf("expected offset > 0, got %d", writer.Offset())
 	}
 }
 

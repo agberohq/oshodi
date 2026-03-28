@@ -76,6 +76,6 @@ func DefaultConfig() *Config {
 		EnableCardinality:       true,
 		CardinalityPrecision:    14,
 		EnableFrequency:         true,
-		Logger:                  ll.New("oshodi").Disable(),
+		Logger:                  ll.New("oshodi").Disable().Suspend(),
 	}
 }

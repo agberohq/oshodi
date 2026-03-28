@@ -1,4 +1,3 @@
-// engine/db.go
 package engine
 
 import (
@@ -245,7 +244,9 @@ func (db *DB) loadIndex() error {
 	store := db.storage.Load()
 	idx := db.index.Load()
 	var offset int64
-	for offset < store.Size() {
+	// Use LogicalSize (actual written bytes), not Size (allocated/pre-allocated).
+	limit := store.LogicalSize()
+	for offset < limit {
 		key, _, tombstone, n, err := store.ReadRecordAt(offset)
 		if err != nil {
 			break
@@ -253,7 +254,7 @@ func (db *DB) loadIndex() error {
 		if !tombstone && len(key) > 0 {
 			idx.Set(key, offset)
 			db.metrics.Add(key)
-		} else if tombstone {
+		} else if tombstone && len(key) > 0 {
 			idx.Delete(key)
 		}
 		offset += n
@@ -318,13 +319,13 @@ func (db *DB) Flush() error {
 func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
+
 	if err := db.writer.Flush(); err != nil {
 		return err
 	}
 
-	// Hold write lock to prevent writes during swap
+	// Hold write lock to ensure atomic swap
 	db.writer.writeMu.Lock()
-	defer db.writer.writeMu.Unlock()
 
 	tmpPath := db.config.FilePath + ".compact"
 	_ = os.Remove(tmpPath)
@@ -334,13 +335,15 @@ func (db *DB) Compact() error {
 	tmpStoreCfg.Compressor = db.storage.Load().Compressor()
 	tmpStore, err := storage.NewFile(tmpStoreCfg)
 	if err != nil {
+		db.writer.writeMu.Unlock()
 		return err
 	}
+
 	newIndex := NewIndex(db.config.BloomExpectedItems, db.config.BloomFalsePositiveRate)
 	oldIndex := db.index.Load()
 	oldStorage := db.storage.Load()
 
-	var newOffset int64
+	var lastOffset int64
 	oldIndex.Range(func(key []byte, offset int64) bool {
 		_, value, tombstone, _, err := oldStorage.ReadRecordAt(offset)
 		if err != nil || tombstone {
@@ -351,32 +354,38 @@ func (db *DB) Compact() error {
 			return false
 		}
 		newIndex.Set(key, newOff)
-		newOffset = newOff // Track last offset
+		lastOffset = newOff
 		return true
 	})
 
 	if err := tmpStore.Sync(); err != nil {
+		db.writer.writeMu.Unlock()
 		_ = tmpStore.Close()
 		_ = os.Remove(tmpPath)
 		return err
 	}
 
-	// Update writer store and reset offset to match new file
+	// Atomic swap: update writer, storage pointer, and index together.
 	db.writer.store.Store(tmpStore)
 	db.writer.offset.Store(tmpStore.LogicalSize())
 	db.storage.Store(tmpStore)
 	db.index.Store(newIndex)
+	db.writer.writeMu.Unlock()
 
-	db.pool.Do(func() {
-		time.Sleep(3 * time.Second)
-		_ = oldStorage.Close()
-		_ = os.Remove(db.config.FilePath)
-		if err := os.Rename(tmpPath, db.config.FilePath); err != nil {
-			db.logger.Fields("error", err).Error("compaction file rename failed")
-		} else {
-			db.logger.Fields("new_size", newOffset, "live_keys", newIndex.Len()).Info("compaction completed gracefully")
-		}
-	})
+	// Clear cache — offsets in the new store differ from the old one.
+	db.cache.Clear()
+
+	// Close old storage; new readers already see tmpStore via the atomic pointer.
+	_ = oldStorage.Close()
+
+	// Rename synchronously so callers see current data immediately.
+	_ = os.Remove(db.config.FilePath)
+	if err := os.Rename(tmpPath, db.config.FilePath); err != nil {
+		db.logger.Fields("error", err).Error("compaction rename failed")
+		return err
+	}
+
+	db.logger.Fields("new_size", lastOffset, "live_keys", newIndex.Len()).Info("compaction completed")
 	return nil
 }
 
