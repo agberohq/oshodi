@@ -81,6 +81,6 @@ func DefaultConfig() *Config {
 		EnableFrequency:         true,
 		Logger:                  ll.New("oshodi").Disable().Suspend(),
 		WALMaxBufSize:           4 * 1024 * 1024, // 4MB
-		DisableWAL:              false,
+		DisableWAL:              true,
 	}
 }

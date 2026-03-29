@@ -41,7 +41,7 @@ func DefaultWALConfig(path string) *WALConfig {
 		BufferSize:    1024,
 		FlushInterval: 1 * time.Millisecond,
 		Mode:          SyncMode,
-		Sync:          true,
+		Sync:          false,
 	}
 }
 
@@ -383,4 +383,61 @@ func (w *WAL) Close() error {
 
 func (w *WAL) Size() int64 {
 	return w.filePos.Load()
+}
+
+// FileSize returns the current byte size of the WAL file.
+// It is an alias for Size() to satisfy the db.go replay interface.
+func (w *WAL) FileSize() int64 {
+	return w.filePos.Load()
+}
+
+// WALReader is a sequential reader for WAL replay on startup.
+// It holds a read cursor and advances record-by-record through the file.
+type WALReader struct {
+	wal    *WAL
+	offset int64
+}
+
+// NewReader creates a WALReader starting at the given byte offset.
+// Pass 0 to replay from the beginning of the file.
+func (w *WAL) NewReader(startOffset int64) *WALReader {
+	return &WALReader{wal: w, offset: startOffset}
+}
+
+// ReadNext reads the next record and returns the raw serialised payload
+// (keyLen[4LE] + key + valueLen[4LE] + value) so the caller can decode it.
+// Returns (nil, io.EOF) when the end of the written region is reached.
+// The dst parameter is reserved for future zero-copy support and is ignored.
+func (r *WALReader) ReadNext(dst []byte) ([]byte, error) {
+	w := r.wal
+	size := w.filePos.Load()
+	if r.offset >= size {
+		return nil, io.EOF
+	}
+
+	// Read keyLen (4 bytes, LittleEndian — matches WAL write path).
+	var keyLenBuf [4]byte
+	if _, err := w.file.ReadAt(keyLenBuf[:], r.offset); err != nil {
+		return nil, err
+	}
+	keyLen := binary.LittleEndian.Uint32(keyLenBuf[:])
+
+	// Read valLen (4 bytes, LittleEndian).
+	valLenOffset := r.offset + 4 + int64(keyLen)
+	var valLenBuf [4]byte
+	if _, err := w.file.ReadAt(valLenBuf[:], valLenOffset); err != nil {
+		return nil, err
+	}
+	valLen := binary.LittleEndian.Uint32(valLenBuf[:])
+
+	// Allocate and read the full record into one contiguous slice.
+	// Layout: keyLen[4] | key[keyLen] | valLen[4] | value[valLen]
+	totalLen := 4 + int(keyLen) + 4 + int(valLen)
+	buf := make([]byte, totalLen)
+	if _, err := w.file.ReadAt(buf, r.offset); err != nil {
+		return nil, err
+	}
+
+	r.offset += int64(totalLen)
+	return buf, nil
 }
