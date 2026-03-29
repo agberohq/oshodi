@@ -9,7 +9,7 @@ import (
 // It uses hash-based keys (uint64) and a sharded map to eliminate string conversions.
 type Cache struct {
 	data *mappo.Sharded[uint64, []byte] // sharded, lock-free map
-	pool *mappo.BytesPool               // buffer pool for returning copies
+	Pool *mappo.BytesPool               // buffer Pool for returning copies
 	size int                            // configured size (used for capacity)
 }
 
@@ -23,7 +23,7 @@ func NewCache(size int) *Cache {
 		data: mappo.NewShardedWithConfig[uint64, []byte](mappo.ShardedConfig{
 			ShardCount: 64, // good default for high concurrency
 		}),
-		pool: mappo.NewBytesPool(1024), // pre-allocate 1KB buffers; will grow as needed
+		Pool: mappo.NewBytesPool(1024), // pre-allocate 1KB buffers; will grow as needed
 		size: size,
 	}
 }
@@ -37,7 +37,7 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 	// Copy from pool to avoid exposing internal slice
-	buf := c.pool.Get()
+	buf := c.Pool.Get()
 	buf = append(buf[:0], val...)
 	return buf, true
 }

@@ -20,14 +20,30 @@ var (
 	ErrCorrupt   = errors.New("storage: corrupt record")
 )
 
+// cacheLinePad is the size of a CPU cache line on all supported architectures
+// (64 bytes on x86/arm64). Fields on separate cache lines never cause
+// false-sharing invalidations when written concurrently.
+const cacheLinePad = 64
+
 type File struct {
 	file   *os.File
 	mmap   atomic.Pointer[mmap.ReaderAt]
 	mmapMu sync.RWMutex
 	path   string
 
-	logicalSize   atomic.Int64
+	// logicalSize is the write cursor: every WriteRecord/WriteTombstone call
+	// does an atomic Add here to claim a non-overlapping file region.
+	// It sits on its own cache line so that concurrent writers on different
+	// cores do not invalidate allocatedSize readers.
+	logicalSize atomic.Int64
+	_           [cacheLinePad - 8]byte
+
+	// allocatedSize is the physical extent of the file as set by Truncate.
+	// It is read on every write (to decide whether to grow) but written
+	// only on the rare grow path. Padding it away from logicalSize means
+	// the grow-check read is not invalidated by every logicalSize.Add.
 	allocatedSize atomic.Int64
+	_             [cacheLinePad - 8]byte
 
 	mu     sync.RWMutex
 	closed atomic.Bool
@@ -126,33 +142,28 @@ func (f *File) remapLoop() {
 }
 
 func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte) (key, value []byte, tombstone bool, n int64, err error) {
-	// Read the fixed 9-byte header in a single call:
-	//   [0:4]  keyLen  (uint32 big-endian)
-	//   [4:8]  valLen  (uint32 big-endian)
-	//   [8]    compressed flag (present only when valLen > 0)
-	// We always read 9 bytes; for tombstones the flag byte is harmless padding.
-	const headerSize = 9
-	var hdr [headerSize]byte
-	if _, err = reader.ReadAt(hdr[:4], offset); err != nil {
+	// Read keyLen first (4 bytes). If zero, we need only 4 more bytes to
+	// distinguish a padding hole from corruption — no key buffer needed.
+	var hdr [4]byte
+	if _, err = reader.ReadAt(hdr[:], offset); err != nil {
 		return
 	}
-	keyLen := binary.BigEndian.Uint32(hdr[:4])
+	keyLen := binary.BigEndian.Uint32(hdr[:])
 	n = 4
 
-	// Zero keyLen: padding hole or an empty tombstone (keyLen==0, valLen==0).
 	if keyLen == 0 {
-		if _, err = reader.ReadAt(hdr[4:8], offset+4); err != nil {
+		// Padding hole or empty tombstone: read valLen to decide.
+		if _, err = reader.ReadAt(hdr[:], offset+4); err != nil {
 			return nil, nil, false, n, err
 		}
-		valLen := binary.BigEndian.Uint32(hdr[4:8])
+		valLen := binary.BigEndian.Uint32(hdr[:])
 		if valLen == 0 {
 			return nil, nil, true, n + 4, nil
 		}
 		return nil, nil, false, n, ErrCorrupt
 	}
 
-	// Read key + valLen + flag in one shot to avoid 3 separate syscalls.
-	// Layout after keyLen: key[keyLen] | valLen[4] | flag[1]
+	// Read key + valLen(4) + flag(1) in a single call to avoid 3 syscalls.
 	metaSize := int64(keyLen) + 4 + 1
 	metaBuf := make([]byte, metaSize)
 	if _, err = reader.ReadAt(metaBuf, offset+4); err != nil {
@@ -164,21 +175,18 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte) (key,
 	n += int64(keyLen) + 4
 
 	if valLen == 0 {
-		// Tombstone: key present, value absent.
 		return key, nil, true, n, nil
 	}
 
 	compressed := metaBuf[keyLen+4] == 1
 	n += 1
 
-	// Read value — reuse dstBuf if it's large enough (zero-alloc hot path).
 	if cap(dstBuf) >= int(valLen) {
 		value = dstBuf[:valLen]
 	} else {
 		value = make([]byte, valLen)
 	}
-	valueOffset := offset + 4 + metaSize
-	if _, err = reader.ReadAt(value, valueOffset); err != nil {
+	if _, err = reader.ReadAt(value, offset+4+metaSize); err != nil {
 		return nil, nil, false, n, err
 	}
 	n += int64(valLen)
@@ -256,11 +264,9 @@ func (f *File) WriteAtomic(p []byte) (int64, error) {
 	n := int64(len(p))
 	off := f.logicalSize.Add(n) - n
 
-	// Lock-free growth check + aggressive pre-allocation to avoid contention
 	if off+n > f.allocatedSize.Load() {
 		f.mu.Lock()
 		if off+n > f.allocatedSize.Load() {
-			// Grow 4× the current request so we rarely hit this path again
 			newSize := off + n + (n * 4)
 			if err := f.file.Truncate(newSize); err != nil {
 				f.mu.Unlock()
@@ -291,7 +297,6 @@ func (f *File) WriteRecord(key, value []byte) (int64, error) {
 	valLen := len(value)
 	compressed := byte(0)
 
-	// Compression is pure CPU work — do it before touching any shared state.
 	if f.compressor != nil && valLen >= f.compressor.Threshold() {
 		if enc, err := f.compressor.Encode(value); err == nil {
 			value = enc
@@ -300,7 +305,6 @@ func (f *File) WriteRecord(key, value []byte) (int64, error) {
 		}
 	}
 
-	// Serialise the record into a local buffer with no locks held.
 	totalSize := int64(4 + keyLen + 4 + 1 + valLen)
 	buf := make([]byte, totalSize)
 	pos := 0
@@ -319,12 +323,10 @@ func (f *File) WriteRecord(key, value []byte) (int64, error) {
 	off := f.logicalSize.Add(totalSize) - totalSize
 
 	// Grow the file if the reservation exceeds the pre-allocated region.
-	// This is the rare path; the file starts at InitialSize so it only triggers
-	// after the initial allocation is exhausted.
 	if off+totalSize > f.allocatedSize.Load() {
 		f.mu.Lock()
 		if off+totalSize > f.allocatedSize.Load() {
-			newSize := off + totalSize + (totalSize * 4) // 4x over-allocation
+			newSize := off + totalSize + (totalSize * 4)
 			if err := f.file.Truncate(newSize); err != nil {
 				f.mu.Unlock()
 				return off, err
@@ -382,7 +384,6 @@ func (f *File) Sync() error {
 }
 
 // Size returns the total allocated size of the file (the current file size on disk).
-// It is safe for concurrent use.
 func (f *File) Size() int64 {
 	return f.allocatedSize.Load()
 }
@@ -392,10 +393,9 @@ func (f *File) LogicalSize() int64 {
 }
 
 // SetLogicalSize updates the logical end of the file.
-// This is heavily required by db.loadIndex() during startup to ignore pre-allocated zero-padding.
+// Required by db.loadIndex() during startup to ignore pre-allocated zero-padding.
 func (f *File) SetLogicalSize(size int64) {
 	f.logicalSize.Store(size)
-	// FIX: Must also update the write cursor tracking
 	f.allocatedSize.Store(size)
 }
 
@@ -420,23 +420,16 @@ func (f *File) IsEmpty() bool {
 	if f.closed.Load() {
 		return true
 	}
-
-	// Fast path check
 	if f.logicalSize.Load() == 0 {
 		return true
 	}
-
-	// Try to read the first record directly from the file.
 	key, _, tombstone, _, err := f.readRecord(f.file, 0, nil)
 	if err != nil {
-		return true // EOF or Corrupt padding hole means it's practically empty
+		return true
 	}
-
-	// If it successfully read a record but it's a padding hole (len(key) == 0)
 	if tombstone && len(key) == 0 {
 		return true
 	}
-
 	return false
 }
 
@@ -447,7 +440,7 @@ func (f *File) Close() error {
 		return nil
 	}
 	f.closed.Store(true)
-	f.mu.Unlock() // Release before Wait so remapLoop can finish without contending.
+	f.mu.Unlock()
 
 	close(f.stopRetry)
 	f.wg.Wait()

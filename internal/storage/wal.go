@@ -41,7 +41,7 @@ func DefaultWALConfig(path string) *WALConfig {
 		BufferSize:    1024,
 		FlushInterval: 1 * time.Millisecond,
 		Mode:          SyncMode,
-		Sync:          false,
+		Sync:          true,
 	}
 }
 
