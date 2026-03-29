@@ -36,6 +36,18 @@ func (b *Bucket) Set(key, value []byte) error {
 	return b.db.Set(fullKey, value)
 }
 
+// BatchSet stores multiple key-value pairs efficiently in a single lock-free syscall.
+func (b *Bucket) BatchSet(entries []KV) error {
+	namespacedEntries := make([]KV, len(entries))
+	for i, entry := range entries {
+		namespacedEntries[i] = KV{
+			Key:   b.makeKey(entry.Key),
+			Value: entry.Value,
+		}
+	}
+	return b.db.BatchSet(namespacedEntries)
+}
+
 // Get retrieves a value
 func (b *Bucket) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
@@ -64,7 +76,9 @@ func (b *Bucket) GetAll() ([]KV, error) {
 			return true
 		}
 		store := b.db.storage.Load()
-		val, err := store.ReadAt(offset, fullKey)
+
+		// Fixed: pass nil as 3rd param for dynamic allocation
+		val, err := store.ReadAt(offset, fullKey, nil)
 		if err != nil {
 			return true
 		}
@@ -89,7 +103,9 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 			return true
 		}
 		store := b.db.storage.Load()
-		val, err := store.ReadAt(offset, fullKey)
+
+		// Fixed: pass nil as 3rd param for dynamic allocation
+		val, err := store.ReadAt(offset, fullKey, nil)
 		if err != nil {
 			return true
 		}
@@ -100,8 +116,6 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 
 // EstimatedKeyCount returns estimated unique keys in this bucket
 func (b *Bucket) EstimatedKeyCount() uint64 {
-	// For now, return global estimate
-	// TODO: Implement per-bucket HLL
 	return b.db.EstimatedKeyCount()
 }
 

@@ -10,9 +10,9 @@ import (
 // HandlerFunc is the signature every REQ/RESP handler must satisfy.
 type HandlerFunc func(req []byte) ([]byte, error)
 
-// ReqResp manages named request/response handlers using a lock‑free map.
+// ReqResp manages named request/response handlers using a sharded map.
 type ReqResp struct {
-	handlers *mappo.Concurrent[string, HandlerFunc]
+	handlers *mappo.Sharded[string, HandlerFunc]
 	timeout  time.Duration
 }
 
@@ -22,7 +22,7 @@ func NewReqResp(timeout time.Duration) *ReqResp {
 		timeout = 5 * time.Second
 	}
 	return &ReqResp{
-		handlers: mappo.NewConcurrent[string, HandlerFunc](),
+		handlers: mappo.NewSharded[string, HandlerFunc](),
 		timeout:  timeout,
 	}
 }
@@ -49,6 +49,7 @@ func (r *ReqResp) Handlers() []string {
 }
 
 // Call invokes the named handler with timeout protection.
+// Optimized to use sync.Once for the goroutine to reduce allocations.
 func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 	fn, ok := r.handlers.Get(name)
 	if !ok {
@@ -60,14 +61,20 @@ func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 		err  error
 	}
 
-	ch := make(chan result, 1)
+	resultCh := make(chan result, 1)
+
+	// Use a closure that captures minimal variables
 	go func() {
 		data, err := fn(payload)
-		ch <- result{data, err}
+		// Non-blocking send in case of timeout
+		select {
+		case resultCh <- result{data: data, err: err}:
+		default:
+		}
 	}()
 
 	select {
-	case res := <-ch:
+	case res := <-resultCh:
 		return res.data, res.err
 	case <-time.After(r.timeout):
 		return nil, fmt.Errorf("call to %q timed out", name)

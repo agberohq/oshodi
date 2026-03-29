@@ -56,6 +56,8 @@ func Open(path string, opts ...Option) (*DB, error) {
 		JackPool:                cfg.JackPool,
 		JackDoctor:              cfg.JackDoctor,
 		JackLifetime:            cfg.JackLifetime,
+		WALMaxBufSize:           cfg.WALMaxBufSize,
+		DisableWAL:              cfg.DisableWAL,
 	}
 
 	inner, err := engine.NewDB(engineCfg)
