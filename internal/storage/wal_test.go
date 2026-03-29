@@ -1,3 +1,4 @@
+// wal_test.go
 package storage
 
 import (
@@ -5,11 +6,17 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
-func TestWALBasicWriteRead(t *testing.T) {
+func TestWALSyncMode(t *testing.T) {
 	tmpDir := t.TempDir()
-	wal, err := NewWAL(filepath.Join(tmpDir, "test.wal"), 1024*1024)
+	walPath := filepath.Join(tmpDir, "test_sync.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
 	if err != nil {
 		t.Fatalf("failed to create WAL: %v", err)
 	}
@@ -18,16 +25,48 @@ func TestWALBasicWriteRead(t *testing.T) {
 	key := []byte("test-key")
 	value := []byte("test-value")
 
-	// Write
 	offset, err := wal.Write(context.Background(), key, value)
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
-	if offset < 0 {
-		t.Errorf("expected positive offset, got %d", offset)
+
+	gotKey, gotValue, err := wal.Read(context.Background(), offset)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(gotKey) != string(key) {
+		t.Errorf("key mismatch: expected %s, got %s", key, gotKey)
+	}
+	if string(gotValue) != string(value) {
+		t.Errorf("value mismatch: expected %s, got %s", value, gotValue)
+	}
+}
+
+func TestWALAsyncMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	walPath := filepath.Join(tmpDir, "test_async.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = AsyncMode
+	cfg.FlushInterval = 10 * time.Millisecond
+
+	wal, err := NewWAL(cfg)
+	if err != nil {
+		t.Fatalf("failed to create WAL: %v", err)
+	}
+	defer wal.Close()
+
+	key := []byte("test-key")
+	value := []byte("test-value")
+
+	offset, err := wal.Write(context.Background(), key, value)
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
 	}
 
-	// Read back
+	// Wait for background flush
+	time.Sleep(50 * time.Millisecond)
+
 	gotKey, gotValue, err := wal.Read(context.Background(), offset)
 	if err != nil {
 		t.Fatalf("read failed: %v", err)
@@ -42,29 +81,96 @@ func TestWALBasicWriteRead(t *testing.T) {
 
 func TestWALMultipleWrites(t *testing.T) {
 	tmpDir := t.TempDir()
-	wal, err := NewWAL(filepath.Join(tmpDir, "test.wal"), 1024*1024)
+	walPath := filepath.Join(tmpDir, "test_multiple.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
 	if err != nil {
 		t.Fatalf("failed to create WAL: %v", err)
 	}
 	defer wal.Close()
 
-	// Write multiple records
-	for i := 0; i < 100; i++ {
+	numWrites := 100
+	offsets := make([]int64, numWrites)
+	written := make(map[int64]string)
+
+	for i := 0; i < numWrites; i++ {
 		key := []byte("key" + string(rune(i)))
 		value := []byte("value" + string(rune(i)))
-		_, err := wal.Write(context.Background(), key, value)
+		offset, err := wal.Write(context.Background(), key, value)
 		if err != nil {
 			t.Fatalf("write %d failed: %v", i, err)
 		}
+		offsets[i] = offset
+		written[offset] = string(value)
+	}
+
+	// Verify all writes are readable
+	for i := 0; i < numWrites; i++ {
+		expectedKey := []byte("key" + string(rune(i)))
+		expectedValue := []byte("value" + string(rune(i)))
+		gotKey, gotValue, err := wal.Read(context.Background(), offsets[i])
+		if err != nil {
+			t.Fatalf("read %d failed: %v", i, err)
+		}
+		if string(gotKey) != string(expectedKey) {
+			t.Errorf("key mismatch at %d: expected %s, got %s", i, expectedKey, gotKey)
+		}
+		if string(gotValue) != string(expectedValue) {
+			t.Errorf("value mismatch at %d: expected %s, got %s", i, expectedValue, gotValue)
+		}
+	}
+}
+
+func TestWALConcurrentWrites(t *testing.T) {
+	tmpDir := t.TempDir()
+	walPath := filepath.Join(tmpDir, "test_concurrent.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
+	if err != nil {
+		t.Fatalf("failed to create WAL: %v", err)
+	}
+	defer wal.Close()
+
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	writesPerGoroutine := 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < writesPerGoroutine; j++ {
+				key := []byte("key" + string(rune(id)) + "-" + string(rune(j)))
+				value := []byte("value" + string(rune(id)) + "-" + string(rune(j)))
+				_, err := wal.Write(context.Background(), key, value)
+				if err != nil {
+					t.Errorf("concurrent write failed: %v", err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if wal.Size() == 0 {
+		t.Error("WAL file is empty after concurrent writes")
 	}
 }
 
 func TestWALRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
-	walPath := filepath.Join(tmpDir, "test.wal")
+	walPath := filepath.Join(tmpDir, "test_recovery.wal")
 
 	// Create and write
-	wal1, err := NewWAL(walPath, 1024*1024)
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal1, err := NewWAL(cfg)
 	if err != nil {
 		t.Fatalf("failed to create WAL: %v", err)
 	}
@@ -81,62 +187,122 @@ func TestWALRecovery(t *testing.T) {
 	}
 	wal1.Close()
 
-	// Reopen and read all entries (simulate recovery)
-	wal2, err := NewWAL(walPath, 1024*1024)
+	// Reopen and read all entries
+	wal2, err := NewWAL(cfg)
 	if err != nil {
 		t.Fatalf("failed to reopen WAL: %v", err)
 	}
 	defer wal2.Close()
 
-	reader := wal2.NewReader(0)
 	recovered := 0
-	for {
-		data, err := reader.ReadNext(nil)
+	offset := int64(0)
+	size := wal2.Size()
+
+	for offset < size {
+		key, value, err := wal2.Read(context.Background(), offset)
 		if err != nil {
-			break // EOF or error
+			if err == ErrWALClosed {
+				break
+			}
+			t.Logf("read error at offset %d: %v", offset, err)
+			break
 		}
-		// Simple decode check
-		if len(data) > 8 {
-			recovered++
+		expectedValue, ok := testData[string(key)]
+		if !ok {
+			t.Errorf("unexpected key: %s", key)
+		} else if string(value) != expectedValue {
+			t.Errorf("value mismatch for key %s: expected %s, got %s", key, expectedValue, value)
 		}
+		offset += 4 + int64(len(key)) + 4 + int64(len(value))
+		recovered++
 	}
+
 	if recovered != 50 {
 		t.Errorf("expected to recover 50 records, got %d", recovered)
 	}
 }
 
-func TestWALConcurrentWrites(t *testing.T) {
+func TestWALCloseFlushesData(t *testing.T) {
 	tmpDir := t.TempDir()
-	wal, err := NewWAL(filepath.Join(tmpDir, "test.wal"), 4*1024*1024)
+	walPath := filepath.Join(tmpDir, "test_close.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = AsyncMode
+	cfg.FlushInterval = 1 * time.Second // Long interval to force close to flush
+
+	wal, err := NewWAL(cfg)
 	if err != nil {
 		t.Fatalf("failed to create WAL: %v", err)
 	}
-	defer wal.Close()
 
-	var wg sync.WaitGroup
-	numGoroutines := 10
-	writesPerGoroutine := 100
+	key := []byte("test-key")
+	value := []byte("test-value")
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < writesPerGoroutine; j++ {
-				key := []byte("key" + string(rune(id)) + "-" + string(rune(j)))
-				value := []byte("value")
-				_, err := wal.Write(context.Background(), key, value)
-				if err != nil {
-					t.Errorf("concurrent write failed: %v", err)
-				}
-			}
-		}(i)
+	offset, err := wal.Write(context.Background(), key, value)
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
 	}
-	wg.Wait()
+
+	// Close should flush
+	err = wal.Close()
+	if err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Reopen and verify data is persisted
+	cfg2 := DefaultWALConfig(walPath)
+	cfg2.Mode = SyncMode
+	wal2, err := NewWAL(cfg2)
+	if err != nil {
+		t.Fatalf("failed to reopen WAL: %v", err)
+	}
+	defer wal2.Close()
+
+	gotKey, gotValue, err := wal2.Read(context.Background(), offset)
+	if err != nil {
+		t.Fatalf("read from reopened WAL failed: %v", err)
+	}
+	if string(gotKey) != string(key) {
+		t.Errorf("key mismatch after reopen: expected %s, got %s", key, gotKey)
+	}
+	if string(gotValue) != string(value) {
+		t.Errorf("value mismatch after reopen: expected %s, got %s", value, gotValue)
+	}
 }
 
-func BenchmarkWALWrite(b *testing.B) {
+func TestWALWriteAfterClose(t *testing.T) {
+	tmpDir := t.TempDir()
+	walPath := filepath.Join(tmpDir, "test_closed.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
+	if err != nil {
+		t.Fatalf("failed to create WAL: %v", err)
+	}
+
+	err = wal.Close()
+	if err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	_, err = wal.Write(context.Background(), []byte("key"), []byte("value"))
+	if err != ErrWALClosed {
+		t.Errorf("expected ErrWALClosed, got %v", err)
+	}
+}
+
+// Benchmarks
+
+func BenchmarkWALSyncModeWrite(b *testing.B) {
 	tmpDir := b.TempDir()
-	wal, err := NewWAL(filepath.Join(tmpDir, "bench.wal"), 4*1024*1024)
+	walPath := filepath.Join(tmpDir, "bench_sync.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
 	if err != nil {
 		b.Fatalf("failed to create WAL: %v", err)
 	}
@@ -154,4 +320,61 @@ func BenchmarkWALWrite(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkWALAsyncModeWrite(b *testing.B) {
+	tmpDir := b.TempDir()
+	walPath := filepath.Join(tmpDir, "bench_async.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = AsyncMode
+	cfg.FlushInterval = 10 * time.Millisecond
+
+	wal, err := NewWAL(cfg)
+	if err != nil {
+		b.Fatalf("failed to create WAL: %v", err)
+	}
+	defer wal.Close()
+
+	key := []byte("test-key")
+	value := []byte("test-value")
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := wal.Write(ctx, key, value)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWALParallelWrite(b *testing.B) {
+	tmpDir := b.TempDir()
+	walPath := filepath.Join(tmpDir, "bench_parallel.wal")
+
+	cfg := DefaultWALConfig(walPath)
+	cfg.Mode = SyncMode
+
+	wal, err := NewWAL(cfg)
+	if err != nil {
+		b.Fatalf("failed to create WAL: %v", err)
+	}
+	defer wal.Close()
+
+	key := []byte("test-key")
+	value := []byte("test-value")
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, err := wal.Write(ctx, key, value)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
