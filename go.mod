@@ -3,11 +3,10 @@ module github.com/agberohq/oshodi
 go 1.26.1
 
 require (
-	github.com/alialaee/logfile v0.0.0-20260313150026-33d3b1d0cdf6
 	github.com/klauspost/compress v1.18.5
 	github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a
 	github.com/olekukonko/ll v0.1.8
-	github.com/olekukonko/mappo v0.0.0-20260328200659-e0e6346b5615
+	github.com/olekukonko/mappo v0.0.0-20260329141345-c5de61574284
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90
 )
