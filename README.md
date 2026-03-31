@@ -1,6 +1,6 @@
 # Oshodi
 
-A high-performance embedded key-value store for Go, designed to work seamlessly with [Agbero](https://github.com/agberohq/agbero) load balancer and [Keeper](https://github.com/agberohq/keeper).
+A high-performance embedded key-value store for Go, designed to work seamlessly with [Agbero](https://github.com/agberohq/agbero) load balancer, for specific needs but its has been more useful than its intended use.
 
 ## Features
 
