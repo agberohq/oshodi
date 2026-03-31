@@ -1,6 +1,6 @@
 module github.com/agberohq/oshodi
 
-go 1.26.1
+go 1.26
 
 require (
 	github.com/klauspost/compress v1.18.5
