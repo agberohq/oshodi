@@ -105,12 +105,6 @@ Oshodi is optimized for:
 - **Memory efficiency**: Memory-mapped files, configurable cache
 - **Almost Zero allocations**: Hot paths avoid heap allocations
 
-## Integration with Agbero & Keeper
-
-Oshodi pairs perfectly with:
-- **Agbero**: Use Oshodi as a distributed state store for load balancer configuration
-- **Keeper**: Store and retrieve secrets, session data, and configuration
-
 ## License
 
 MIT
