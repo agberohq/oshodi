@@ -12,7 +12,7 @@ import (
 	"github.com/olekukonko/mappo"
 )
 
-// pubsubJob is a reusable task to completely eliminate closure allocations during publish
+// pubsubJob is a reusable task to eliminate closure allocations during publish.
 type pubsubJob struct {
 	fn      func([]byte)
 	payload []byte
@@ -33,7 +33,6 @@ func (j *pubsubJob) Do() error {
 				).Error("pubsub panic")
 			}
 		}
-		// Clean up and recycle back to the pool
 		j.fn = nil
 		j.payload = nil
 		pubsubJobPool.Put(j)
@@ -49,6 +48,21 @@ var pubsubJobPool = sync.Pool{
 	},
 }
 
+// subEntry caches subscriber id+fn pairs collected during Range to avoid
+// repeated pool gets inside the iteration loop.
+type subEntry struct {
+	id int64
+	fn func([]byte)
+}
+
+// subEntryPool reuses the slice header for subscriber snapshots.
+var subEntryPool = sync.Pool{
+	New: func() any {
+		b := make([]subEntry, 0, 64)
+		return &b
+	},
+}
+
 // Channel holds subscribers for a specific bucket+channel
 type Channel struct {
 	subs *mappo.Sharded[int64, func([]byte)]
@@ -57,14 +71,19 @@ type Channel struct {
 // PubSub is a high-performance publish-subscribe system
 type PubSub struct {
 	channels *mappo.Sharded[string, *Channel]
-	pool     *jack.Pool
-	logger   *ll.Logger
-	nextID   atomic.Int64
-	hooks    *pipeline.Hooks
+	// chanMu serialises channel-table create/cleanup.
+	chanMu sync.Mutex
+	pool   *jack.Pool
+	logger *ll.Logger
+	nextID atomic.Int64
+	hooks  *pipeline.Hooks
+	// copyPayload: each subscriber receives its own payload copy instead of
+	// the shared slice. Default off (subscribers must not mutate payloads).
+	copyPayload bool
 }
 
 // NewPubSub creates a new PubSub instance
-func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks) *PubSub {
+func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks, copyPayload bool) *PubSub {
 	if logger == nil {
 		logger = ll.New("pubsub").Disable()
 	}
@@ -73,14 +92,18 @@ func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks) *PubSu
 		pool:     pool,
 		logger:   logger,
 		hooks:    hooks,
+		copyPayload: copyPayload,
 	}
 }
 
+// channelSeparator joins the bucket-qualified channel name.
+const channelSeparator = "\x00"
+
 func chanKey(bucket, channel string) string {
 	if bucket == "" {
-		return "\x00" + channel
+		return channelSeparator + channel
 	}
-	return bucket + "\x00" + channel
+	return bucket + channelSeparator + channel
 }
 
 // Subscribe adds a subscriber and returns its ID and an unsubscribe function
@@ -88,17 +111,12 @@ func (ps *PubSub) Subscribe(bucket, channel string, fn func([]byte)) (int64, fun
 	key := chanKey(bucket, channel)
 	id := ps.nextID.Add(1)
 
-	// Load or create channel atomically
-	ch, loaded := ps.channels.Get(key)
-	if !loaded {
-		ch = &Channel{
-			subs: mappo.NewSharded[int64, func([]byte)](),
-		}
-		ps.channels.SetIfAbsent(key, ch)
-		ch, _ = ps.channels.Get(key)
-	}
-
+	ps.chanMu.Lock()
+	ch, _ := ps.channels.GetOrSet(key, &Channel{
+		subs: mappo.NewSharded[int64, func([]byte)](),
+	})
 	ch.subs.Set(id, fn)
+	ps.chanMu.Unlock()
 
 	if ps.hooks != nil && ps.hooks.OnSubscribe != nil {
 		ps.hooks.OnSubscribe(bucket, channel, id)
@@ -121,6 +139,12 @@ func (ps *PubSub) unsubscribeByID(bucket, channel string, id int64) {
 	if ch, ok := ps.channels.Get(key); ok {
 		ch.subs.Delete(id)
 	}
+	// Drop empty channel tables so channel churn does not leak entries.
+	ps.chanMu.Lock()
+	if ch, ok := ps.channels.Get(key); ok && ch.subs.Len() == 0 {
+		ps.channels.Delete(key)
+	}
+	ps.chanMu.Unlock()
 	if ps.hooks != nil && ps.hooks.OnUnsubscribe != nil {
 		ps.hooks.OnUnsubscribe(bucket, channel, id)
 	}
@@ -158,7 +182,9 @@ func (ps *PubSub) IDs(bucket, channel string) []int64 {
 	return nil
 }
 
-// Publish sends a payload to all subscribers of a channel
+// Publish sends a payload to all subscribers of a channel.
+// It snapshots the subscriber list first to avoid holding the sharded map
+// during dispatch, then submits each subscriber as a pooled job.
 func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 	if ps.hooks != nil && ps.hooks.OnPublish != nil {
 		var err error
@@ -174,24 +200,35 @@ func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 		return 0, nil
 	}
 
-	// Count subscribers first
-	count := ch.subs.Len()
+	// Snapshot subscribers into a pooled slice to avoid pool.Get inside Range.
+	entriesPtr := subEntryPool.Get().(*[]subEntry)
+	entries := (*entriesPtr)[:0]
+	ch.subs.Range(func(id int64, fn func([]byte)) bool {
+		entries = append(entries, subEntry{id: id, fn: fn})
+		return true
+	})
+	count := len(entries)
 	if count == 0 {
+		*entriesPtr = entries
+		subEntryPool.Put(entriesPtr)
 		return 0, nil
 	}
 
-	// Iterate and submit jobs - Sharded.Range is already optimized
-	ch.subs.Range(func(id int64, fn func([]byte)) bool {
+	submitted := 0
+	for i := range entries {
+		e := &entries[i]
 		job := pubsubJobPool.Get().(*pubsubJob)
-		job.fn = fn
-		job.payload = payload
+		job.fn = e.fn
+		if ps.copyPayload {
+			job.payload = append([]byte(nil), payload...)
+		} else {
+			job.payload = payload
+		}
 		job.logger = ps.logger
-		job.id = id
+		job.id = e.id
 		job.channel = channel
 
-		// Submit asynchronously
 		if err := ps.pool.Submit(job); err != nil {
-			// On error, recycle and continue
 			job.fn = nil
 			job.payload = nil
 			pubsubJobPool.Put(job)
@@ -199,9 +236,14 @@ func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 				"error", err,
 				"channel", channel,
 			).Warn("failed to submit pubsub job to worker pool")
+			continue
 		}
-		return true
-	})
+		submitted++
+	}
 
-	return count, nil
+	// Reset and recycle the snapshot slice.
+	*entriesPtr = entries[:0]
+	subEntryPool.Put(entriesPtr)
+
+	return submitted, nil
 }

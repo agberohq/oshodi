@@ -172,3 +172,18 @@ func BenchmarkReqRespCall(b *testing.B) {
 		rr.Call(name, payload)
 	}
 }
+
+func BenchmarkReqRespCallDirect(b *testing.B) {
+	rr := NewReqResp(5 * time.Second)
+	name := "bench-handler"
+	rr.Register(name, func(req []byte) ([]byte, error) {
+		return []byte("response"), nil
+	})
+
+	payload := []byte("request")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rr.CallDirect(name, payload)
+	}
+}

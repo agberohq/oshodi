@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/olekukonko/mappo"
@@ -9,6 +10,23 @@ import (
 
 // HandlerFunc is the signature every REQ/RESP handler must satisfy.
 type HandlerFunc func(req []byte) ([]byte, error)
+
+// callResult holds the outcome of a single Call invocation so the channel
+// carries a single typed value instead of an anonymous struct literal.
+type callResult struct {
+	data []byte
+	err  error
+}
+
+// resultPool avoids allocating a buffered channel on every Call.
+var resultPool = sync.Pool{
+	New: func() any { return make(chan callResult, 1) },
+}
+
+// timerPool reuses time.Timer values to avoid per-call heap allocations.
+var timerPool = sync.Pool{
+	New: func() any { return time.NewTimer(time.Hour) },
+}
 
 // ReqResp manages named request/response handlers using a sharded map.
 type ReqResp struct {
@@ -49,34 +67,43 @@ func (r *ReqResp) Handlers() []string {
 }
 
 // Call invokes the named handler with timeout protection.
-// Optimized to use sync.Once for the goroutine to reduce allocations.
+// Uses pooled channels and timers to eliminate per-call allocations.
 func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 	fn, ok := r.handlers.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("no handler registered for %q", name)
 	}
 
-	type result struct {
-		data []byte
-		err  error
-	}
+	ch := resultPool.Get().(chan callResult)
+	defer resultPool.Put(ch)
 
-	resultCh := make(chan result, 1)
-
-	// Use a closure that captures minimal variables
 	go func() {
 		data, err := fn(payload)
-		// Non-blocking send in case of timeout
 		select {
-		case resultCh <- result{data: data, err: err}:
+		case ch <- callResult{data: data, err: err}:
 		default:
 		}
 	}()
 
+	// Reuse a pooled timer to avoid heap allocation.
+	timer := timerPool.Get().(*time.Timer)
+	timer.Reset(r.timeout)
+
 	select {
-	case res := <-resultCh:
+	case res := <-ch:
+		// A fired-but-undrained channel would deliver a stale firing to
+		// the next pool user as an instant bogus timeout — drain or drop.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerPool.Put(timer)
 		return res.data, res.err
-	case <-time.After(r.timeout):
+	case <-timer.C:
+		// The firing was consumed by this select, so the timer is drained.
+		timerPool.Put(timer)
 		return nil, fmt.Errorf("call to %q timed out", name)
 	}
 }

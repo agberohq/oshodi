@@ -12,7 +12,7 @@ import (
 
 func TestNewPubSub(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 	if ps == nil {
 		t.Fatal("pubsub is nil")
 	}
@@ -23,7 +23,7 @@ func TestNewPubSub(t *testing.T) {
 
 func TestPubSubSubscribeAndPublish(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 	received := make(chan []byte, 1)
@@ -55,7 +55,7 @@ func TestPubSubSubscribeAndPublish(t *testing.T) {
 
 func TestPubSubMultipleSubscribers(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 	var wg sync.WaitGroup
@@ -99,7 +99,7 @@ func TestPubSubMultipleSubscribers(t *testing.T) {
 
 func TestPubSubUnsubscribe(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 	var receivedCount int32
@@ -129,7 +129,7 @@ func TestPubSubUnsubscribe(t *testing.T) {
 
 func TestPubSubUnsubscribeAll(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 	var receivedCount int32
@@ -160,7 +160,7 @@ func TestPubSubUnsubscribeAll(t *testing.T) {
 
 func TestPubSubCount(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 
@@ -181,7 +181,7 @@ func TestPubSubCount(t *testing.T) {
 // internal/messaging/pubsub_test.go - Fix the IDs test
 func TestPubSubIDs(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 
@@ -203,7 +203,7 @@ func TestPubSubIDs(t *testing.T) {
 
 func TestPubSubDifferentBuckets(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	bucket1 := "bucket1"
 	bucket2 := "bucket2"
@@ -234,7 +234,7 @@ func TestPubSubDifferentBuckets(t *testing.T) {
 
 func TestPubSubPanicRecovery(t *testing.T) {
 	pool := jack.NewPool(10)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 
@@ -254,7 +254,7 @@ func TestPubSubPanicRecovery(t *testing.T) {
 
 func BenchmarkPubSubPublish(b *testing.B) {
 	pool := jack.NewPool(100)
-	ps := NewPubSub(pool, nil, nil)
+	ps := NewPubSub(pool, nil, nil, false)
 
 	channel := "test-channel"
 	payload := []byte("test")
