@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 )
 
 // bucketKeySeparator joins the bucket name and the user key/channel/handler
@@ -21,6 +22,11 @@ func (b *Bucket) makeKey(userKey []byte) []byte {
 	key = append(key, b.prefix...)
 	key = append(key, userKey...)
 	return key
+}
+
+// MakeKey exposes the bucket-prefixed key form for external batch helpers.
+func (b *Bucket) MakeKey(userKey []byte) []byte {
+	return b.makeKey(userKey)
 }
 
 // parseKey extracts user key from full key
@@ -116,6 +122,45 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 		return fn(userKey, val)
 	})
 	return nil
+}
+
+// ScanE is the error-propagating scan: storage read errors, context
+// cancellation and callback errors all terminate the scan and are returned
+// (Scan skips unreadable records instead). Iteration order is unspecified
+// and concurrent writes may be missed or observed — no snapshot isolation.
+func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	idx := b.db.index.Load()
+	store := b.db.storage.Load()
+	var scanErr error
+	idx.Range(func(fullKey []byte, offset int64) bool {
+		userKey := b.parseKey(fullKey)
+		if userKey == nil {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			scanErr = ctx.Err()
+			return false
+		default:
+		}
+		val, err := store.ReadAt(offset, fullKey, nil)
+		if err != nil {
+			scanErr = err
+			return false
+		}
+		if err := fn(append([]byte(nil), userKey...), val); err != nil {
+			scanErr = err
+			return false
+		}
+		return true
+	})
+	return scanErr
 }
 
 // EstimatedKeyCount returns estimated unique keys in this bucket

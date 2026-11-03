@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrClosed   = errors.New("oshodi: database closed")
-	ErrKeyEmpty = errors.New("oshodi: key cannot be empty")
+	ErrClosed      = errors.New("oshodi: database closed")
+	ErrKeyEmpty    = errors.New("oshodi: key cannot be empty")
+	ErrKeyNotFound = engine.ErrKeyNotFound
 )
 
 // DB is the main database handle
@@ -392,6 +393,35 @@ func (b *Bucket) GetAll() ([]KV, error) {
 // Scan iterates over all key-value pairs without copying
 func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 	return b.inner.Scan(fn)
+}
+
+// ScanE is the error-propagating scan: storage read errors, context
+// cancellation and callback errors terminate the scan and are returned.
+// Iteration order is unspecified; no snapshot isolation. See the graph
+// layer and data-import use cases.
+func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanE(ctx, fn)
+}
+
+// BatchSet writes multiple records; per-entry semantics only, not
+// transactional.
+func (b *Bucket) BatchSet(entries []KV) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	for i := range entries {
+		if len(entries[i].Key) == 0 {
+			return ErrKeyEmpty
+		}
+	}
+	namespaced := make([]engine.KV, len(entries))
+	for i := range entries {
+		namespaced[i] = engine.KV{Key: b.inner.MakeKey(entries[i].Key), Value: entries[i].Value}
+	}
+	return b.db.inner.BatchSet(namespaced)
 }
 
 // EstimatedKeyCount returns estimated unique keys in this bucket
