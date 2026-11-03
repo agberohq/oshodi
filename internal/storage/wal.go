@@ -3,28 +3,27 @@ package storage
 import (
 	"context"
 	"encoding/binary"
+	"hash/crc32"
 	"errors"
 	"io"
 	"os"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/olekukonko/mappo"
 )
 
 var (
-	ErrWALClosed     = errors.New("wal: closed")
-	ErrWALCorrupted  = errors.New("wal: corrupted record")
-	ErrWALBufferFull = errors.New("wal: buffer full")
+	ErrWALClosed    = errors.New("wal: closed")
+	ErrWALCorrupted = errors.New("wal: corrupted record")
 )
 
 type WALMode int
 
 const (
-	SyncMode WALMode = iota
-	AsyncMode
+	// AsyncMode is the zero value so an unset WLabMode selects asymptotic
+	// throughput: writes are batched by the flusher with no per-write fsync.
+	AsyncMode WALMode = iota
+	SyncMode
 )
 
 type WALConfig struct {
@@ -38,30 +37,34 @@ type WALConfig struct {
 func DefaultWALConfig(path string) *WALConfig {
 	return &WALConfig{
 		Path:          path,
-		BufferSize:    1024,
-		FlushInterval: 1 * time.Millisecond,
-		Mode:          SyncMode,
+		BufferSize:    DefaultWALBufferSize,
+		FlushInterval: DefaultWALFlushInterval,
+		Mode:          AsyncMode, // async by default for performance
 		Sync:          false,
 	}
 }
 
+// record is one unflushed WAL entry held in memory until the next flush batch.
 type record struct {
 	offset int64
 	key    []byte
-	value  []byte
+	value  []byte // nil for tombstones
+	tomb   bool
 }
 
 type WAL struct {
 	file *os.File
 	path string
 
-	records *mappo.Slicer[record]
+	// pending is swapped with pendingSpare on every flush; memory stays
+	// bounded by one flush window.
+	mu           sync.Mutex
+	pending      []record
+	pendingSpare []record
 
 	flushCh chan struct{}
 	closeCh chan struct{}
 	wg      sync.WaitGroup
-
-	mu sync.Mutex
 
 	filePos  atomic.Int64
 	flushPos atomic.Int64
@@ -78,6 +81,9 @@ func NewWAL(cfg *WALConfig) (*WAL, error) {
 	if cfg == nil {
 		cfg = DefaultWALConfig("wal.log")
 	}
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = 10 * time.Millisecond
+	}
 
 	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -93,7 +99,6 @@ func NewWAL(cfg *WALConfig) (*WAL, error) {
 	wal := &WAL{
 		file:          f,
 		path:          cfg.Path,
-		records:       mappo.NewSlicer[record](),
 		flushCh:       make(chan struct{}, 1),
 		closeCh:       make(chan struct{}),
 		mode:          cfg.Mode,
@@ -101,6 +106,8 @@ func NewWAL(cfg *WALConfig) (*WAL, error) {
 		flushInterval: cfg.FlushInterval,
 		sync:          cfg.Sync,
 	}
+
+	fsyncDir(cfg.Path)
 
 	wal.filePos.Store(info.Size())
 	wal.flushPos.Store(info.Size())
@@ -120,24 +127,83 @@ func NewWAL(cfg *WALConfig) (*WAL, error) {
 	return wal, nil
 }
 
+// walRecordCRC computes the CRC-Castagnoli over a WAL record frame:
+// [keyLen(4LE) | key | valLen(4LE) | value].
+func walRecordCRC(keyLen uint32, key []byte, valLen uint32, value []byte) uint32 {
+	var scratch [4]byte
+	binary.LittleEndian.PutUint32(scratch[:], keyLen)
+	crc := crc32.Checksum(scratch[:], crc32cTable)
+	crc = crc32.Update(crc, crc32cTable, key)
+	binary.LittleEndian.PutUint32(scratch[:], valLen)
+	crc = crc32.Update(crc, crc32cTable, scratch[:])
+	if len(value) > 0 {
+		crc = crc32.Update(crc, crc32cTable, value)
+	}
+	return crc
+}
+
+// recordLen is the serialised length of a record, including the CRC trailer.
+// Tombstone sentinel lengths are just marker values in the valLen field —
+// they contribute no physical payload bytes.
+func (w *WAL) recordLen(key, value []byte, tomb bool) int {
+	_ = tomb
+	return 4 + len(key) + 4 + len(value) + RecordCRCSize
+}
+
 func (w *WAL) Write(ctx context.Context, key, value []byte) (int64, error) {
 	if w.closed.Load() {
 		return 0, ErrWALClosed
 	}
+	if len(key) == 0 {
+		return 0, ErrWALCorrupted
+	}
 
-	recordLen := 4 + len(key) + 4 + len(value)
-	offset := w.filePos.Add(int64(recordLen)) - int64(recordLen)
+	// Caller slices are frequently reused; the WAL owns its copy until
+	// the async flush serialises the record.
+	rl := w.recordLen(key, value, false)
+	buf := make([]byte, len(key)+len(value))
+	copy(buf, key)
+	copy(buf[len(key):], value)
+	ownedKey := buf[:len(key)]
+	ownedVal := buf[len(key):]
 
-	keyCopy := make([]byte, len(key))
-	valueCopy := make([]byte, len(value))
-	copy(keyCopy, key)
-	copy(valueCopy, value)
+	w.mu.Lock()
+	offset := w.filePos.Add(int64(rl)) - int64(rl)
+	w.pending = append(w.pending, record{offset: offset, key: ownedKey, value: ownedVal})
+	w.mu.Unlock()
 
-	w.records.Append(record{
-		offset: offset,
-		key:    keyCopy,
-		value:  valueCopy,
-	})
+	if w.mode == SyncMode {
+		if err := w.flushToDisk(); err != nil {
+			return offset, err
+		}
+	} else {
+		select {
+		case w.flushCh <- struct{}{}:
+		default:
+		}
+	}
+
+	return offset, nil
+}
+
+// WriteTombstone appends a delete marker for key. The marker carries a
+// 0xFFFFFFFF value-length sentinel so it can never be replayed as a regular
+// record with an empty value.
+func (w *WAL) WriteTombstone(ctx context.Context, key []byte) (int64, error) {
+	if w.closed.Load() {
+		return 0, ErrWALClosed
+	}
+	if len(key) == 0 {
+		return 0, ErrWALCorrupted
+	}
+
+	rl := w.recordLen(key, nil, true)
+	w.mu.Lock()
+	offset := w.filePos.Add(int64(rl)) - int64(rl)
+	buf := make([]byte, len(key))
+	copy(buf, key)
+	w.pending = append(w.pending, record{offset: offset, key: buf, tomb: true})
+	w.mu.Unlock()
 
 	if w.mode == SyncMode {
 		if err := w.flushToDisk(); err != nil {
@@ -154,55 +220,69 @@ func (w *WAL) Write(ctx context.Context, key, value []byte) (int64, error) {
 }
 
 func (w *WAL) flushToDisk() error {
+	// mu is held for the whole flush so concurrent flush triggers cannot
+	// interleave writes at the same file offset.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	flushPos := w.flushPos.Load()
-	currentFilePos := w.filePos.Load()
-
-	if currentFilePos <= flushPos {
+	if len(w.pending) == 0 {
 		return nil
 	}
 
-	var recordsToFlush []record
+	// Swap the pending queue out and reset the slot for future writes.
+	batch := w.pending
+	w.pending = w.pendingSpare[:0]
+	w.pendingSpare = batch
 
-	w.records.Range(func(idx uint64, r record) bool {
-		if r.offset >= flushPos && r.offset < currentFilePos {
-			recordsToFlush = append(recordsToFlush, r)
+	// Encode in file order: pending appends hold mu together with the
+	// filePos advance, so order is exact.
+	totalBufSize := 0
+	for i := range batch {
+		totalBufSize += w.recordLen(batch[i].key, batch[i].value, batch[i].tomb)
+	}
+	buf := make([]byte, totalBufSize)
+	pos := 0
+	encoded := 0
+	for i := range batch {
+		valLen := uint32(len(batch[i].value))
+		if batch[i].tomb {
+			valLen = WALTombstoneValLen
 		}
-		return true
-	})
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(len(batch[i].key)))
+		pos += 4
+		pos += copy(buf[pos:], batch[i].key)
+		binary.LittleEndian.PutUint32(buf[pos:], valLen)
+		pos += 4
+		pos += copy(buf[pos:], batch[i].value)
 
-	if len(recordsToFlush) == 0 {
-		return nil
+		// CRC-Castagnoli over this record's frame.
+		binary.LittleEndian.PutUint32(buf[pos:], walRecordCRC(
+			uint32(len(batch[i].key)), batch[i].key, valLen, batch[i].value))
+		pos += RecordCRCSize
+		encoded = pos
 	}
 
-	sort.Slice(recordsToFlush, func(i, j int) bool {
-		return recordsToFlush[i].offset < recordsToFlush[j].offset
-	})
+	flushPos := w.flushPos.Load()
+	nextFlushPos := flushPos + int64(encoded)
 
-	buf := make([]byte, 0)
-
-	for _, r := range recordsToFlush {
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(r.key)))
-		buf = append(buf, r.key...)
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(r.value)))
-		buf = append(buf, r.value...)
-	}
-
-	_, err := w.file.WriteAt(buf, flushPos)
+	_, err := w.file.WriteAt(buf[:encoded], flushPos)
 	if err != nil {
 		return err
 	}
 
 	if w.sync {
 		if err := w.file.Sync(); err != nil {
+			w.flushPos.Store(nextFlushPos)
 			return err
 		}
 	}
 
-	w.flushPos.Store(currentFilePos)
+	w.flushPos.Store(nextFlushPos)
 
+	// Release the batch's references so its memory is collectable.
+	for i := range batch {
+		batch[i] = record{}
+	}
 	return nil
 }
 
@@ -211,108 +291,103 @@ func (w *WAL) Read(ctx context.Context, offset int64) (key, value []byte, err er
 		return nil, nil, ErrWALClosed
 	}
 
-	var found *record
-
-	w.records.Range(func(idx uint64, r record) bool {
-		if r.offset == offset {
-			found = &r
-			return false
+	w.mu.Lock()
+	for i := range w.pending {
+		if w.pending[i].offset == offset {
+			k := make([]byte, len(w.pending[i].key))
+			copy(k, w.pending[i].key)
+			var v []byte
+			if !w.pending[i].tomb {
+				v = make([]byte, len(w.pending[i].value))
+				copy(v, w.pending[i].value)
+			}
+			w.mu.Unlock()
+			return k, v, nil
 		}
-		return true
-	})
-
-	if found != nil {
-		key = make([]byte, len(found.key))
-		value = make([]byte, len(found.value))
-		copy(key, found.key)
-		copy(value, found.value)
-		return key, value, nil
 	}
+	w.mu.Unlock()
 
 	return w.readFromDisk(offset)
 }
 
-func (w *WAL) readFromDisk(offset int64) (key, value []byte, err error) {
+func (w *WAL) readRecordAt(offset int64) (key, value []byte, tomb bool, next int64, err error) {
 	var keyLenBuf [4]byte
-	_, err = w.file.ReadAt(keyLenBuf[:], offset)
-	if err != nil {
-		return nil, nil, err
+	if _, err = w.file.ReadAt(keyLenBuf[:], offset); err != nil {
+		return
 	}
 	keyLen := binary.LittleEndian.Uint32(keyLenBuf[:])
+	if keyLen == 0 || keyLen > MaxLegalKeyLen {
+		return nil, nil, false, offset, ErrWALCorrupted
+	}
 
 	key = make([]byte, keyLen)
-	_, err = w.file.ReadAt(key, offset+4)
-	if err != nil {
-		return nil, nil, err
+	if _, err = w.file.ReadAt(key, offset+4); err != nil {
+		return
 	}
 
 	var valLenBuf [4]byte
 	valOffset := offset + 4 + int64(keyLen)
-
-	_, err = w.file.ReadAt(valLenBuf[:], valOffset)
-	if err != nil {
-		return nil, nil, err
+	if _, err = w.file.ReadAt(valLenBuf[:], valOffset); err != nil {
+		return
 	}
 	valLen := binary.LittleEndian.Uint32(valLenBuf[:])
 
-	value = make([]byte, valLen)
-	_, err = w.file.ReadAt(value, valOffset+4)
-	if err != nil {
-		return nil, nil, err
+	if valLen == WALTombstoneValLen {
+		return key, nil, true, valOffset + 4, nil
+	}
+	if valLen > MaxLegalValLen {
+		return nil, nil, false, offset, ErrWALCorrupted
 	}
 
-	return key, value, nil
+	value = make([]byte, valLen)
+	if valLen > 0 {
+		if _, err = w.file.ReadAt(value, valOffset+4); err != nil {
+			return
+		}
+	}
+
+	// CRC trailer over the frame.
+	var crcBuf [RecordCRCSize]byte
+	if _, err = w.file.ReadAt(crcBuf[:], valOffset+4+int64(valLen)); err != nil {
+		return
+	}
+	valueLen := uint32(len(value))
+	if binary.LittleEndian.Uint32(crcBuf[:]) != walRecordCRC(keyLen, key, valueLen, value) {
+		err = ErrWALCorrupted
+		return
+	}
+	return key, value, false, valOffset + 4 + int64(valLen) + RecordCRCSize, nil
 }
 
+func (w *WAL) readFromDisk(offset int64) (key, value []byte, err error) {
+	k, v, _, _, err := w.readRecordAt(offset)
+	return k, v, err
+}
+
+// recover validates the on-disk WAL contents and positions the append and
+// flush cursors at the last intact record boundary. A torn tail — a crash
+// in the middle of a partially flushed record — is truncated instead of
+// failing the open, so a crash never makes the database unopenable.
 func (w *WAL) recover() error {
 	offset := int64(0)
 	size := w.filePos.Load()
 
 	for offset < size {
-		var keyLenBuf [4]byte
-		_, err := w.file.ReadAt(keyLenBuf[:], offset)
+		_, _, _, next, err := w.readRecordAt(offset)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+			// Torn tail: drop the incomplete record.
+			break
 		}
-
-		keyLen := binary.LittleEndian.Uint32(keyLenBuf[:])
-
-		key := make([]byte, keyLen)
-		_, err = w.file.ReadAt(key, offset+4)
-		if err != nil {
-			return err
-		}
-
-		var valLenBuf [4]byte
-		valOffset := offset + 4 + int64(keyLen)
-
-		_, err = w.file.ReadAt(valLenBuf[:], valOffset)
-		if err != nil {
-			return err
-		}
-
-		valLen := binary.LittleEndian.Uint32(valLenBuf[:])
-
-		value := make([]byte, valLen)
-		_, err = w.file.ReadAt(value, valOffset+4)
-		if err != nil {
-			return err
-		}
-
-		w.records.Append(record{
-			offset: offset,
-			key:    key,
-			value:  value,
-		})
-
-		offset += 4 + int64(keyLen) + 4 + int64(valLen)
+		offset = next
 	}
 
-	w.filePos.Store(offset)
-	w.flushPos.Store(offset)
+	if offset < size {
+		if err := w.file.Truncate(offset); err != nil {
+			return err
+		}
+		w.filePos.Store(offset)
+		w.flushPos.Store(offset)
+	}
 
 	return nil
 }
@@ -405,7 +480,9 @@ func (w *WAL) NewReader(startOffset int64) *WALReader {
 }
 
 // ReadNext reads the next record and returns the raw serialised payload
-// (keyLen[4LE] + key + valueLen[4LE] + value) so the caller can decode it.
+// (keyLen[4LE] + key + valueLen[4LE] + value). A deleted record carries the
+// WALTombstoneValLen sentinel as the value length; such records are
+// deletions. A value length of 0 is a regular empty-value record.
 // Returns (nil, io.EOF) when the end of the written region is reached.
 // The dst parameter is reserved for future zero-copy support and is ignored.
 func (r *WALReader) ReadNext(dst []byte) ([]byte, error) {
@@ -415,29 +492,31 @@ func (r *WALReader) ReadNext(dst []byte) ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	// Read keyLen (4 bytes, LittleEndian — matches WAL write path).
-	var keyLenBuf [4]byte
-	if _, err := w.file.ReadAt(keyLenBuf[:], r.offset); err != nil {
+	key, _, tomb, next, err := w.readRecordAt(r.offset)
+	if err != nil {
 		return nil, err
 	}
-	keyLen := binary.LittleEndian.Uint32(keyLenBuf[:])
 
-	// Read valLen (4 bytes, LittleEndian).
-	valLenOffset := r.offset + 4 + int64(keyLen)
-	var valLenBuf [4]byte
-	if _, err := w.file.ReadAt(valLenBuf[:], valLenOffset); err != nil {
-		return nil, err
-	}
-	valLen := binary.LittleEndian.Uint32(valLenBuf[:])
-
-	// Allocate and read the full record into one contiguous slice.
-	// Layout: keyLen[4] | key[keyLen] | valLen[4] | value[valLen]
-	totalLen := 4 + int(keyLen) + 4 + int(valLen)
+	totalLen := int(next - r.offset)
 	buf := make([]byte, totalLen)
-	if _, err := w.file.ReadAt(buf, r.offset); err != nil {
-		return nil, err
+	pos := 0
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(key)))
+	pos += 4
+	copy(buf[pos:], key)
+	pos += len(key)
+	if tomb {
+		binary.LittleEndian.PutUint32(buf[pos:], WALTombstoneValLen)
+		pos += 4
+	} else {
+		// The value occupies every remaining byte of the frame.
+		valueLen := totalLen - pos - 4
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(valueLen))
+		pos += 4
+		if _, err := w.file.ReadAt(buf[pos:], r.offset+int64(pos)); err != nil {
+			return nil, err
+		}
 	}
 
-	r.offset += int64(totalLen)
+	r.offset = next
 	return buf, nil
 }

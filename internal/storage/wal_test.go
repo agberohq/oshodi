@@ -213,7 +213,7 @@ func TestWALRecovery(t *testing.T) {
 		} else if string(value) != expectedValue {
 			t.Errorf("value mismatch for key %s: expected %s, got %s", key, expectedValue, value)
 		}
-		offset += 4 + int64(len(key)) + 4 + int64(len(value))
+		offset += 4 + int64(len(key)) + 4 + int64(len(value)) + RecordCRCSize
 		recovered++
 	}
 
