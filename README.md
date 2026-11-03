@@ -97,6 +97,39 @@ bucket.RegisterHandler("echo", func(req []byte) ([]byte, error) {
 response, _ := bucket.Call("echo", []byte("ping"))
 ```
 
+## Graph Traversals
+
+Oshodi ships a property graph layer on top of the same storage engine.
+Vertices and edges are ordinary records; adjacency is rebuilt on open.
+
+```go
+import "github.com/agberohq/oshodi/graph"
+
+g, err := graph.Open(db)
+if err != nil {
+    log.Fatal(err)
+}
+defer g.Close()
+
+g.AddVertex("artist:1", "artist", []byte(`{"name":"drake"}`))
+g.AddVertex("song:1", "song", []byte(`{"name":"hotline bling"}`))
+g.AddEdge("artist:1", "song:1", "performs", nil)
+
+// traverse: two hops, filter by property, deterministic order
+n, _ := g.V("artist:1").Out("performs").Has("name", "hotline bling").Count()
+
+// algorithms: PageRank over every vertex, BFS distances
+pr, _ := g.PageRank(0.85, 20)
+dist, _ := g.BFS("artist:1", graph.Outgoing)
+
+// user-defined map over the element stream (never writes)
+ids, _ := g.V("Artist:1").MutateID(strings.ToLower).Out("performs").IDs()
+```
+
+Traversal semantics: live, weakly consistent views (a mutation may land
+between two stages); algorithms like PageRank hold a stable topology for
+the whole computation. One graph handle per database.
+
 ## Performance
 
 Oshodi is optimized for:
