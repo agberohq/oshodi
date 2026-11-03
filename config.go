@@ -3,6 +3,7 @@ package oshodi
 import (
 	"time"
 
+	"github.com/agberohq/oshodi/internal/pipeline"
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
 )
@@ -53,6 +54,32 @@ type Config struct {
 
 	WALMaxBufSize int
 	DisableWAL    bool
+
+	// WALSync enables per-write fsync durability (Sync mode) when the WAL
+	// is enabled. Async flush (default) trades crash-window durability for
+	// throughput; see the durability section in lab docs.
+	WALSync bool
+
+	// WALFlushInterval controls how often the async WAL flusher persists
+	// buffered writes. 0 selects 10ms.
+	WALFlushInterval time.Duration
+
+	// MaxKeySize caps key length (protects the decoder and bounds memory
+	// from corrupt length prefixes). 0 selects 1MB.
+	MaxKeySize int
+
+	// MaxValueSize caps value length on writes. 0 selects 1GB.
+	MaxValueSize int
+
+	// EnableWriteCoalescing switches Set() to leader-based group commit:
+	// concurrent writers are merged into one physical write. Default off.
+	EnableWriteCoalescing bool
+
+	// PubSubPayloadCopy gives every subscriber its own payload copy.
+	PubSubPayloadCopy bool
+
+	// Hooks intercept Set/Get/Delete (optional, may be nil).
+	Hooks *pipeline.Hooks
 }
 
 // DefaultConfig returns a config with sensible defaults
@@ -76,11 +103,16 @@ func DefaultConfig() *Config {
 		CompactionMinItems:      1000,
 		CompactionFragmentation: 0.3,
 		CompactionInterval:      30 * time.Minute,
-		EnableCardinality:       true,
+		EnableCardinality:       false, // opt-in via WithCardinality()
 		CardinalityPrecision:    14,
-		EnableFrequency:         true,
+		EnableFrequency:         false, // opt-in via WithFrequency()
 		Logger:                  ll.New("oshodi").Disable().Suspend(),
-		WALMaxBufSize:           4 * 1024 * 1024, // 4MB
-		DisableWAL:              true,
+		// DisableWAL by default: no WAL overhead, main storage durability
+		// only. Enable via WithWAL(true) and choose sync/async durability
+		// via WithWALSyncMode.
+		WALMaxBufSize: 4 * 1024 * 1024, // 4MB
+		DisableWAL:    true,
+		MaxKeySize:    1 << 20, // 1MB cap keeps the decoder unambiguous
+		MaxValueSize:  1 << 30,
 	}
 }

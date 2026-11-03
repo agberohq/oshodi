@@ -96,7 +96,14 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 	}
 
 	keyLen := len(key)
-	totalSize := 4 + keyLen + 4 + 1 + valLen
+	payloadSize := 4 + keyLen + 4 + 1 + valLen
+	totalSize := payloadSize + storage.RecordCRCSize
+
+	// Zero-length values carry RecordFlagEmptyValue.
+	flag := compressed
+	if valLen == 0 {
+		flag = storage.RecordFlagEmptyValue
+	}
 
 	// 2. Expand buffer if the record is larger than 1KB
 	if cap(buf) < totalSize {
@@ -113,9 +120,10 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 	pos += keyLen
 	binary.BigEndian.PutUint32(buf[pos:], uint32(valLen))
 	pos += 4
-	buf[pos] = compressed
+	buf[pos] = flag
 	pos += 1
-	copy(buf[pos:], value)
+	pos += copy(buf[pos:], value)
+	binary.BigEndian.PutUint32(buf[pos:], storage.RecordChecksum(buf[:payloadSize]))
 
 	// 4. Lock-free write via Offset Reservation Pattern
 	offset, err := sw.store.Load().WriteAtomic(buf)
@@ -128,22 +136,42 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 }
 
 // BatchWriteRecord heavily optimizes throughput by merging multiple records into a single WriteAtomic OS Syscall.
+// Compressed values are staged locally — the caller's entries are never mutated.
 func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
 	bufPtr := sw.encoderPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 
 	comp := sw.store.Load().Compressor()
 	var totalSize int
 
-	// Pre-calculate total size and compress in-place
+	// Stage compressed values in a local slice (nil = not compressed).
+	// Writing into entries[i].Value would hand the caller back compressed
+	// bytes in place of its own data — never mutate caller-owned slices.
+	compressedVals := make([][]byte, len(entries))
+	flags := make([]byte, len(entries))
+
 	for i := range entries {
+		keyLen := len(entries[i].Key)
 		valLen := len(entries[i].Value)
+
+		flag := byte(0)
 		if comp != nil && valLen >= comp.Threshold() {
 			if enc, err := comp.Encode(entries[i].Value); err == nil {
-				entries[i].Value = enc
+				compressedVals[i] = enc
+				valLen = len(enc)
+				flag = 1
 			}
 		}
-		totalSize += 4 + len(entries[i].Key) + 4 + 1 + len(entries[i].Value)
+		if valLen == 0 {
+			// Zero-length values carry RecordFlagEmptyValue.
+			flag = storage.RecordFlagEmptyValue
+		}
+		flags[i] = flag
+		totalSize += 4 + keyLen + 4 + 1 + valLen + storage.RecordCRCSize
 	}
 
 	if cap(buf) < totalSize {
@@ -155,20 +183,34 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 	pos := 0
 	offsets := make([]int64, len(entries))
 
-	for _, entry := range entries {
-		keyLen := len(entry.Key)
-		valLen := len(entry.Value)
+	for i := range entries {
+		keyLen := len(entries[i].Key)
+		staged := compressedVals[i] != nil // compressed; empty-value marker (0x01) has nothing staged
+		valLen := len(entries[i].Value)
+		if staged {
+			valLen = len(compressedVals[i])
+		}
 
 		binary.BigEndian.PutUint32(buf[pos:], uint32(keyLen))
 		pos += 4
-		copy(buf[pos:], entry.Key)
+		copy(buf[pos:], entries[i].Key)
 		pos += keyLen
 		binary.BigEndian.PutUint32(buf[pos:], uint32(valLen))
 		pos += 4
-		buf[pos] = 0 // Compression already applied to entry.Value if needed
+		buf[pos] = flags[i]
 		pos += 1
-		copy(buf[pos:], entry.Value)
+
+		if staged {
+			copy(buf[pos:], compressedVals[i])
+		} else {
+			copy(buf[pos:], entries[i].Value)
+		}
 		pos += valLen
+
+		// Per-record CRC trailer over this record's serialised payload.
+		recordStart := pos - valLen - 1 - 4 - keyLen - 4
+		binary.BigEndian.PutUint32(buf[pos:], storage.RecordChecksum(buf[recordStart:pos]))
+		pos += storage.RecordCRCSize
 	}
 
 	// Single lock-free syscall for the entire batch!
@@ -179,9 +221,15 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 
 	// Calculate individual logical offsets for the index
 	currentOffset := baseOffset
-	for i, entry := range entries {
+	for i := range entries {
+		keyLen := len(entries[i].Key)
+		staged := compressedVals[i] != nil
+		valLen := len(entries[i].Value)
+		if staged {
+			valLen = len(compressedVals[i])
+		}
 		offsets[i] = currentOffset
-		currentOffset += int64(4 + len(entry.Key) + 4 + 1 + len(entry.Value))
+		currentOffset += int64(4 + keyLen + 4 + 1 + valLen + storage.RecordCRCSize)
 	}
 
 	*bufPtr = buf[:0]
@@ -191,7 +239,9 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 }
 
 // WriteTombstone creates a deletion marker lock-free and appends it to storage.
-func (sw *ShardedWriter) WriteTombstone(key []byte) error {
+// It returns the tombstone record's file offset so callers can retire the
+// index entry in offset order (set-after-delete races).
+func (sw *ShardedWriter) WriteTombstone(key []byte) (int64, error) {
 	h := xxh3.Hash(key)
 	idx := uint32(h) & sw.mask
 	shard := sw.shards[idx]
@@ -200,7 +250,8 @@ func (sw *ShardedWriter) WriteTombstone(key []byte) error {
 	buf := (*bufPtr)[:0]
 
 	keyLen := len(key)
-	totalSize := 4 + keyLen + 4
+	payloadSize := 4 + keyLen + 4 + 1
+	totalSize := payloadSize + storage.RecordCRCSize
 
 	if cap(buf) < totalSize {
 		buf = make([]byte, totalSize)
@@ -213,14 +264,18 @@ func (sw *ShardedWriter) WriteTombstone(key []byte) error {
 	pos += 4
 	copy(buf[pos:], key)
 	pos += keyLen
-	binary.BigEndian.PutUint32(buf[pos:], 0) // zero value length marks tombstone
+	binary.BigEndian.PutUint32(buf[pos:], 0) // zero value length
+	pos += 4
+	buf[pos] = storage.RecordFlagTombstone
+	pos += 1
+	binary.BigEndian.PutUint32(buf[pos:], storage.RecordChecksum(buf[:payloadSize]))
 
-	_, err := sw.store.Load().WriteAtomic(buf)
+	offset, err := sw.store.Load().WriteAtomic(buf)
 
 	*bufPtr = buf[:0]
 	shard.bufferPool.Put(bufPtr)
 
-	return err
+	return offset, err
 }
 
 // Flush ensures the OS page cache is synced to the underlying disk.

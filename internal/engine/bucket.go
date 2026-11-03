@@ -4,6 +4,10 @@ import (
 	"bytes"
 )
 
+// bucketKeySeparator joins the bucket name and the user key/channel/handler
+// name to build the fully-qualified key.
+const bucketKeySeparator = "\x00"
+
 // Bucket represents a namespaced collection
 type Bucket struct {
 	name   string
@@ -127,52 +131,52 @@ func (b *Bucket) GetKeyFrequency(key []byte) uint64 {
 
 // Publish sends a message to a channel
 func (b *Bucket) Publish(channel string, payload []byte) (int, error) {
-	return b.db.Publish(b.name+"\x00"+channel, payload)
+	return b.db.Publish(b.name+bucketKeySeparator+channel, payload)
 }
 
 // Subscribe registers a callback for a channel
 func (b *Bucket) Subscribe(channel string, fn func([]byte)) func() {
-	return b.db.Subscribe(b.name+"\x00"+channel, fn)
+	return b.db.Subscribe(b.name+bucketKeySeparator+channel, fn)
 }
 
 // SubscribeWithID registers a callback and returns subscription ID
 func (b *Bucket) SubscribeWithID(channel string, fn func([]byte)) (int64, func()) {
-	return b.db.SubscribeWithID(b.name+"\x00"+channel, fn)
+	return b.db.SubscribeWithID(b.name+bucketKeySeparator+channel, fn)
 }
 
 // RegisterHandler registers a bucket-scoped handler
 func (b *Bucket) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
-	b.db.RegisterHandler(b.name+"\x00"+name, fn)
+	b.db.RegisterHandler(b.name+bucketKeySeparator+name, fn)
 }
 
 // UnregisterHandler removes a bucket-scoped handler
 func (b *Bucket) UnregisterHandler(name string) {
-	b.db.UnregisterHandler(b.name + "\x00" + name)
+	b.db.UnregisterHandler(b.name + bucketKeySeparator + name)
 }
 
 // Call invokes a bucket-scoped handler
 func (b *Bucket) Call(name string, payload []byte) ([]byte, error) {
-	return b.db.Call(b.name+"\x00"+name, payload)
+	return b.db.Call(b.name+bucketKeySeparator+name, payload)
 }
 
 // CallDirect invokes a bucket-scoped handler directly
 func (b *Bucket) CallDirect(name string, payload []byte) ([]byte, error) {
-	return b.db.CallDirect(b.name+"\x00"+name, payload)
+	return b.db.CallDirect(b.name+bucketKeySeparator+name, payload)
 }
 
 // UnsubscribeAll removes all subscribers from a channel
 func (b *Bucket) UnsubscribeAll(channel string) {
-	b.db.UnsubscribeAll(b.name + "\x00" + channel)
+	b.db.UnsubscribeAll(b.name + bucketKeySeparator + channel)
 }
 
 // GetSubscriptionCount returns number of subscribers on a channel
 func (b *Bucket) GetSubscriptionCount(channel string) int {
-	return b.db.GetSubscriptionCount(b.name + "\x00" + channel)
+	return b.db.GetSubscriptionCount(b.name + bucketKeySeparator + channel)
 }
 
 // GetAllSubscriptionIDs returns all subscription IDs on a channel
 func (b *Bucket) GetAllSubscriptionIDs(channel string) []int64 {
-	return b.db.GetAllSubscriptionIDs(b.name + "\x00" + channel)
+	return b.db.GetAllSubscriptionIDs(b.name + bucketKeySeparator + channel)
 }
 
 // KV represents a key-value pair

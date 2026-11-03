@@ -3,6 +3,8 @@ package oshodi
 import (
 	"time"
 
+	"github.com/agberohq/oshodi/internal/pipeline"
+
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
 )
@@ -170,6 +172,70 @@ func WithDoctor(doctor *jack.Doctor) Option {
 func WithLifetime(lifetime *jack.Lifetime) Option {
 	return func(c *Config) {
 		c.JackLifetime = lifetime
+	}
+}
+
+// WithPubSubPayloadCopy delivers each subscriber its own payload copy.
+func WithPubSubPayloadCopy(enable bool) Option {
+	return func(c *Config) {
+		c.PubSubPayloadCopy = enable
+	}
+}
+
+// WithHooks attaches Set/Get/Delete interceptor hooks.
+func WithHooks(h *pipeline.Hooks) Option {
+	return func(c *Config) {
+		c.Hooks = h
+	}
+}
+
+// WithWAL enables or disables the Write-Ahead Log. When enabled without
+// WithWALSyncMode, the WAL runs in async flush mode (10ms window).
+func WithWAL(enable bool) Option {
+	return func(c *Config) {
+		c.DisableWAL = !enable
+	}
+}
+
+// WithWALSyncMode selects per-write fsync durability (true, Sync mode) or
+// batched async flush (false, throughput default) for an enabled WAL.
+func WithWALSyncMode(sync bool) Option {
+	return func(c *Config) {
+		c.WALSync = sync
+	}
+}
+
+// WithWALFlushInterval sets the async WAL flusher period.
+func WithWALFlushInterval(interval time.Duration) Option {
+	return func(c *Config) {
+		if interval > 0 {
+			c.WALFlushInterval = interval
+		}
+	}
+}
+
+// WithMaxValueSize caps the maximum value length accepted on writes.
+func WithMaxValueSize(size int) Option {
+	return func(c *Config) {
+		if size > 0 {
+			c.MaxValueSize = size
+		}
+	}
+}
+
+// WithWriteCoalescing enables leader-based group commit on the write path.
+func WithWriteCoalescing(enable bool) Option {
+	return func(c *Config) {
+		c.EnableWriteCoalescing = enable
+	}
+}
+
+// WithMaxKeySize caps the maximum key length accepted on writes.
+func WithMaxKeySize(size int) Option {
+	return func(c *Config) {
+		if size > 0 {
+			c.MaxKeySize = size
+		}
 	}
 }
 

@@ -2,10 +2,10 @@ package metrics
 
 // Manager coordinates zero-lock global database analytics.
 // Eliminated the internal mappo.Concurrent lookup to ensure 0 map lookups on the database insertion hot path.
+// The Bloom filter is NOT managed here; it is owned by the Index to avoid duplicate updates.
 type Manager struct {
 	globalHLL    *HyperLogLog
 	globalSketch *CountMinSketch
-	bloom        *BloomFilter
 
 	enableHLL bool
 	enableCMS bool
@@ -28,12 +28,9 @@ func NewManager(enableCardinality bool, precision uint8, enableFrequency bool) *
 	return m
 }
 
-// SetBloomFilter binds the engine's primary bloom filter to the analytics sink.
-func (m *Manager) SetBloomFilter(bf *BloomFilter) {
-	m.bloom = bf
-}
-
 // Add pushes a key to all enabled analytics components using direct pointers.
+// The Bloom filter is NOT updated here; it is owned by the Index and updated
+// once per write via Index.Set() to avoid duplicate work.
 func (m *Manager) Add(key []byte) {
 	if m.enableHLL && m.globalHLL != nil {
 		m.globalHLL.Add(key)
@@ -41,11 +38,6 @@ func (m *Manager) Add(key []byte) {
 
 	if m.enableCMS && m.globalSketch != nil {
 		m.globalSketch.Add(key)
-	}
-
-	// Bloom is typically managed tightly by the Index itself, but added here for global completeness.
-	if m.bloom != nil {
-		m.bloom.Add(key)
 	}
 }
 

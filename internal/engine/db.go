@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"io"
 
 	"github.com/agberohq/oshodi/internal/messaging"
 	"github.com/agberohq/oshodi/internal/metrics"
@@ -18,10 +22,15 @@ import (
 )
 
 var (
-	ErrKeyNotFound = errors.New("oshodi: key not found")
-	ErrBufferFull  = errors.New("oshodi: write buffer full")
-	ErrKeyEmpty    = errors.New("oshodi: key cannot be empty")
+	ErrKeyNotFound   = errors.New("oshodi: key not found")
+	ErrKeyEmpty      = errors.New("oshodi: key cannot be empty")
+	ErrBufferFull    = errors.New("oshodi: write buffer full")
+	ErrDBClosed      = errors.New("oshodi: database closed")
+	ErrKeyTooLarge   = errors.New("oshodi: key exceeds configured maximum size")
+	ErrValueTooLarge = errors.New("oshodi: value exceeds configured maximum size")
 )
+
+const DefaultMaxKeySize = 1 << 20 // 1MB
 
 type DBStats struct {
 	NumKeys         int
@@ -42,11 +51,13 @@ type DB struct {
 	pubsub   *messaging.PubSub
 	handlers *messaging.ReqResp
 	metrics  *metrics.Manager
+	hooks    *pipeline.Hooks
 	config   *Config
 
 	// Locks
 	writeCommitMu sync.RWMutex
 	compactMu     sync.Mutex
+	coalescer     *writeCoalescer
 	wal           atomic.Pointer[storage.WAL]
 
 	stop      chan struct{}
@@ -58,6 +69,7 @@ type DB struct {
 	lifetime  *jack.Lifetime
 	doctor    *jack.Doctor
 	ownPool   bool
+	lockFile  io.Closer
 }
 
 type Config struct {
@@ -89,6 +101,52 @@ type Config struct {
 	JackLifetime            *jack.Lifetime
 	WALMaxBufSize           int
 	DisableWAL              bool
+
+	// WALSync enables per-write fsync durability on the WAL (SyncMode with
+	// sync). When false the WAL uses AsyncMode + periodic flush, which is
+	// the throughput default. DisableWAL takes precedence.
+	WALSync bool
+
+	// WALFlushInterval is the async flusher period. 0 selects 10ms.
+	WALFlushInterval time.Duration
+
+	// MaxKeySize caps key length on writes. 0 selects DefaultMaxKeySize.
+	MaxKeySize int
+
+	// MaxValueSize caps value length on writes (decode rejects values past
+	// MaxLegalValLen regardless). 0 selects MaxLegalValLen.
+	MaxValueSize int
+
+	// EnableWriteCoalescing switches Set() to leader-based group commit.
+	// Default off.
+	EnableWriteCoalescing bool
+
+	// PubSubPayloadCopy gives each subscriber its own payload copy instead
+	// of the shared slice (subscriber mutation safety).
+	PubSubPayloadCopy bool
+
+	// Hooks, when set, intercept Set/Get/Delete. OnWrite may transform the
+	// value or reject the write; OnRead may transform the returned value;
+	// OnDelete may veto.
+	Hooks *pipeline.Hooks
+}
+
+// newWALConfig resolves the user's WAL settings onto a storage.WALConfig.
+func newWALConfig(config *Config, walPath string) *storage.WALConfig {
+	walCfg := storage.DefaultWALConfig(walPath)
+	if config.WALMaxBufSize > 0 {
+		walCfg.BufferSize = config.WALMaxBufSize
+	}
+	if config.WALSync {
+		walCfg.Mode = storage.SyncMode
+		walCfg.Sync = true
+	} else {
+		walCfg.Mode = storage.AsyncMode
+	}
+	if config.WALFlushInterval > 0 {
+		walCfg.FlushInterval = config.WALFlushInterval
+	}
+	return walCfg
 }
 
 // NewDB creates a database instance with the given configuration.
@@ -98,29 +156,26 @@ func NewDB(config *Config) (*DB, error) {
 	if config == nil {
 		config = &Config{}
 	}
-	if config.WriterBufferSize <= 0 {
-		config.WriterBufferSize = 1024
-	}
-	if config.FlushTimeout <= 0 {
-		config.FlushTimeout = 10 * time.Second
+	if config.InitialFileSize <= 0 {
+		config.InitialFileSize = DefaultInitialFileSize
 	}
 	if config.CompactionMinItems <= 0 {
-		config.CompactionMinItems = 1000
+		config.CompactionMinItems = DefaultCompactionMinItems
 	}
 	if config.CompactionFragmentation <= 0 {
-		config.CompactionFragmentation = 0.3
+		config.CompactionFragmentation = DefaultCompactionFragmentation
 	}
 	if config.CompactionInterval <= 0 {
-		config.CompactionInterval = 30 * time.Minute
+		config.CompactionInterval = DefaultCompactionInterval
 	}
 	if config.PoolSize <= 0 {
-		config.PoolSize = 10
+		config.PoolSize = DefaultPoolSize
 	}
 	if config.CacheSize <= 0 {
-		config.CacheSize = 10000
+		config.CacheSize = DefaultCacheSize
 	}
 	if config.SplitMutexShards <= 0 {
-		config.SplitMutexShards = 64
+		config.SplitMutexShards = DefaultShardCount
 	}
 	if config.Logger == nil {
 		config.Logger = ll.New("oshodi").Disable()
@@ -133,6 +188,30 @@ func NewDB(config *Config) (*DB, error) {
 	}
 	if config.BloomFalsePositiveRate == 0 {
 		config.BloomFalsePositiveRate = 0.01
+	}
+	if config.MaxKeySize <= 0 {
+		config.MaxKeySize = DefaultMaxKeySize
+	}
+	if config.MaxKeySize >= int(storage.MaxLegalKeyLen) {
+		return nil, fmt.Errorf("oshodi: MaxKeySize %d must stay below %d", config.MaxKeySize, storage.MaxLegalKeyLen)
+	}
+	if config.MaxValueSize <= 0 {
+		config.MaxValueSize = int(storage.MaxLegalValLen)
+	}
+	if config.EnableWriteCoalescing && config.SplitMutexShards <= 0 {
+		config.SplitMutexShards = DefaultShardCount
+	}
+	if config.BatchMinSize <= 0 {
+		config.BatchMinSize = 1
+	}
+	if config.BatchMaxSize < config.BatchMinSize {
+		config.BatchMaxSize = config.BatchMinSize
+	}
+	if config.BatchTimeout <= 0 {
+		config.BatchTimeout = DefaultCoalesceWindow
+	}
+	if config.SetQueueCapacity <= 0 {
+		config.SetQueueCapacity = DefaultQueueCapacity
 	}
 
 	var pool *jack.Pool
@@ -152,6 +231,11 @@ func NewDB(config *Config) (*DB, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	lockFile, err := storage.AcquireFileLock(config.FilePath)
+	if err != nil {
+		return nil, err
 	}
 
 	storeCfg := storage.DefaultFileConfig(config.FilePath)
@@ -176,10 +260,10 @@ func NewDB(config *Config) (*DB, error) {
 
 	cache := pipeline.NewCache(config.CacheSize)
 	metricsMgr := metrics.NewManager(config.EnableCardinality, config.CardinalityPrecision, config.EnableFrequency)
-	metricsMgr.SetBloomFilter(idx.bloom)
 
 	db := &DB{
 		writer:    writer,
+		lockFile:  lockFile,
 		cache:     cache,
 		pool:      pool,
 		metrics:   metricsMgr,
@@ -187,14 +271,25 @@ func NewDB(config *Config) (*DB, error) {
 		stop:      make(chan struct{}),
 		compactCh: make(chan struct{}, 1),
 		logger:    config.Logger,
+		hooks:     config.Hooks,
 		lifetime:  config.JackLifetime,
 		doctor:    config.JackDoctor,
 		ownPool:   ownPool,
 	}
 
+	if config.EnableWriteCoalescing {
+		db.coalescer = newWriteCoalescer(
+			config.SplitMutexShards,
+			config.BatchMinSize,
+			config.BatchMaxSize,
+			config.SetQueueCapacity,
+			config.BatchTimeout,
+		)
+	}
+
 	db.storage.Store(store)
 	db.index.Store(idx)
-	db.pubsub = messaging.NewPubSub(pool, config.Logger, nil)
+	db.pubsub = messaging.NewPubSub(pool, config.Logger, config.Hooks, config.PubSubPayloadCopy)
 	db.handlers = messaging.NewReqResp(5 * time.Second)
 
 	// Initialise WAL only if explicitly enabled (disabled by default for performance)
@@ -202,8 +297,8 @@ func NewDB(config *Config) (*DB, error) {
 		if config.WALMaxBufSize <= 0 {
 			config.WALMaxBufSize = 4 * 1024 * 1024
 		}
-		walPath := config.FilePath + ".wal"
-		wal, err := storage.NewWAL(&storage.WALConfig{Path: walPath, BufferSize: config.WALMaxBufSize})
+		walCfg := newWALConfig(config, config.FilePath+storage.FilenameSuffixWAL)
+		wal, err := storage.NewWAL(walCfg)
 		if err != nil {
 			store.Close()
 			return nil, err
@@ -243,14 +338,16 @@ func NewDB(config *Config) (*DB, error) {
 			}
 
 			var value []byte
-			if valueLen > 0 {
+			if valueLen > 0 && valueLen != storage.WALTombstoneValLen {
 				value = data[4+keyLen+4 : 4+keyLen+4+valueLen]
 			}
 
-			if valueLen == 0 {
-				db.Delete(key)
+			isDelete := valueLen == storage.WALTombstoneValLen
+
+			if isDelete {
+				_ = db.Delete(key)
 			} else {
-				db.Set(key, value)
+				_ = db.Set(key, value)
 			}
 			replayCount++
 		}
@@ -346,7 +443,6 @@ func (db *DB) loadIndex() error {
 
 		if !tombstone && len(key) > 0 {
 			idx.Set(key, offset)
-			db.metrics.Add(key)
 		} else if tombstone && len(key) > 0 {
 			idx.Delete(key)
 		}
@@ -362,8 +458,17 @@ func (db *DB) loadIndex() error {
 // then to the main storage under a read-lock that blocks during compaction swaps,
 // and finally updates the index and cache.
 func (db *DB) Set(key, value []byte) error {
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
 	if len(key) == 0 {
-		return errors.New("oshodi: key cannot be empty")
+		return ErrKeyEmpty
+	}
+	if len(key) > db.config.MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if len(value) > db.config.MaxValueSize {
+		return ErrValueTooLarge
 	}
 
 	if wal := db.wal.Load(); wal != nil {
@@ -378,53 +483,96 @@ func (db *DB) Set(key, value []byte) error {
 		}
 	}
 
-	db.metrics.Add(key)
+	// Hooks run after the WAL write; OnWrite may still reject the commit.
+	if db.hooks != nil && db.hooks.OnWrite != nil {
+		transformed, err := db.hooks.OnWrite(pipeline.HookContext{Bucket: "", Key: key, Value: value})
+		if err != nil {
+			return err
+		}
+		value = transformed
+	}
 
+	if db.coalescer != nil {
+		return db.coalesceSet(key, value)
+	}
+	return db.commitDirect(key, value)
+}
+
+// commitDirect is the uncoalesced write path: one record, immediate index
+// and cache update under the shared write lock.
+func (db *DB) commitDirect(key, value []byte) error {
 	// Hold RLock so Compact's write-lock waits for in-flight writes to drain
-	// before swapping the storage pointer. Without this a Set can write to
-	// the old storage after the compaction has already atomically replaced it,
-	// silently losing the write.
-	db.writeCommitMu.RLock()
-	offset, err := db.writer.WriteRecord(key, value)
+	// before swapping the storage pointer.
+	offset, err := func() (int64, error) {
+		db.writeCommitMu.RLock()
+		defer db.writeCommitMu.RUnlock()
+		return db.writer.WriteRecord(key, value)
+	}()
 	if err != nil {
-		db.writeCommitMu.RUnlock()
 		return err
 	}
-	db.index.Load().Set(key, offset)
-	db.writeCommitMu.RUnlock()
-
+	db.metrics.Add(key)
+	db.index.Load().SetIfNewer(key, offset)
 	db.cache.Delete(key)
 	return nil
 }
 
 // Get retrieves the value for a key. It checks the cache first,
 // then the Bloom filter, the index, and finally reads from storage.
+// Reads race with compaction swaps: an index snapshot paired with a
+// storage file that has since been replaced returns a mismatch. That is
+// transient — reload index + storage and retry rather than surfacing a
+// corruption error to the caller.
 func (db *DB) Get(key []byte) ([]byte, error) {
+	if db.closed.Load() {
+		return nil, ErrDBClosed
+	}
 	if len(key) == 0 {
 		return nil, ErrKeyNotFound
 	}
 	if val, ok := db.cache.Get(key); ok {
+		return db.applyReadHook(key, val)
+	}
+
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		idx := db.index.Load()
+		if !idx.MaybeHas(key) {
+			return nil, ErrKeyNotFound
+		}
+		offset, ok := idx.Get(key)
+		if !ok {
+			return nil, ErrKeyNotFound
+		}
+		store := db.storage.Load()
+
+		buf := db.cache.Pool.Get()
+		val, err := store.ReadValueAt(offset, key, buf)
+		if err != nil {
+			db.cache.Pool.Put(buf)
+			if errors.Is(err, storage.ErrCorrupt) || errors.Is(err, storage.ErrClosed) {
+				// Stale index/storage pairing mid-compaction — retry.
+				continue
+			}
+			return nil, err
+		}
+
+		db.cache.Set(key, val)
+		return db.applyReadHook(key, val)
+	}
+	return nil, ErrKeyNotFound
+}
+
+// applyReadHook runs OnRead after a successful read (cache hit or decode).
+func (db *DB) applyReadHook(key, val []byte) ([]byte, error) {
+	if db.hooks == nil || db.hooks.OnRead == nil {
 		return val, nil
 	}
-	idx := db.index.Load()
-	if !idx.MaybeHas(key) {
-		return nil, ErrKeyNotFound
-	}
-	offset, ok := idx.Get(key)
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-	store := db.storage.Load()
-
-	buf := db.cache.Pool.Get()
-	val, err := store.ReadAt(offset, key, buf)
+	transformed, err := db.hooks.OnRead(pipeline.HookContext{Key: key, Value: val})
 	if err != nil {
-		db.cache.Pool.Put(buf)
 		return nil, err
 	}
-
-	db.cache.Set(key, val)
-	return val, nil
+	return transformed, nil
 }
 
 // Delete removes a key. It writes a tombstone to the WAL and main storage,
@@ -433,12 +581,17 @@ func (db *DB) Delete(key []byte) error {
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
+	if db.hooks != nil && db.hooks.OnDelete != nil {
+		if err := db.hooks.OnDelete(pipeline.HookContext{Key: key}); err != nil {
+			return err
+		}
+	}
 
 	if wal := db.wal.Load(); wal != nil {
-		_, err := wal.Write(context.Background(), key, nil)
+		_, err := wal.WriteTombstone(context.Background(), key)
 		if err != nil && errors.Is(err, storage.ErrWALClosed) {
 			if newWal := db.wal.Load(); newWal != nil && newWal != wal {
-				_, err = newWal.Write(context.Background(), key, nil)
+				_, err = newWal.WriteTombstone(context.Background(), key)
 			}
 		}
 		if err != nil {
@@ -446,13 +599,18 @@ func (db *DB) Delete(key []byte) error {
 		}
 	}
 
-	db.writeCommitMu.RLock()
-	defer db.writeCommitMu.RUnlock()
-
-	if err := db.writer.WriteTombstone(key); err != nil {
+	var tombstoneOffset int64
+	err := func() error {
+		db.writeCommitMu.RLock()
+		defer db.writeCommitMu.RUnlock()
+		off, err := db.writer.WriteTombstone(key)
+		tombstoneOffset = off
+		return err
+	}()
+	if err != nil {
 		return err
 	}
-	db.index.Load().Delete(key)
+	db.index.Load().DeleteIfStale(key, tombstoneOffset)
 	db.cache.Delete(key)
 	return nil
 }
@@ -461,16 +619,30 @@ func (db *DB) Delete(key []byte) error {
 // It writes all entries to the WAL (if enabled), then performs a single batch
 // write to main storage under a read-lock, updating the index and cache.
 func (db *DB) BatchSet(entries []KV) error {
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
 	if len(entries) == 0 {
 		return nil
 	}
+	for i := range entries {
+		if len(entries[i].Key) == 0 {
+			return ErrKeyEmpty
+		}
+		if len(entries[i].Key) > db.config.MaxKeySize {
+			return ErrKeyTooLarge
+		}
+		if len(entries[i].Value) > db.config.MaxValueSize {
+			return ErrValueTooLarge
+		}
+	}
 
 	if wal := db.wal.Load(); wal != nil {
-		for _, entry := range entries {
-			_, err := wal.Write(context.Background(), entry.Key, entry.Value)
+		for i := range entries {
+			_, err := wal.Write(context.Background(), entries[i].Key, entries[i].Value)
 			if err != nil && errors.Is(err, storage.ErrWALClosed) {
 				if newWal := db.wal.Load(); newWal != nil && newWal != wal {
-					_, err = newWal.Write(context.Background(), entry.Key, entry.Value)
+					_, err = newWal.Write(context.Background(), entries[i].Key, entries[i].Value)
 				}
 			}
 			if err != nil {
@@ -479,21 +651,20 @@ func (db *DB) BatchSet(entries []KV) error {
 		}
 	}
 
-	db.writeCommitMu.RLock()
-	offsets, err := db.writer.BatchWriteRecord(entries)
+	offsets, err := func() ([]int64, error) {
+		db.writeCommitMu.RLock()
+		defer db.writeCommitMu.RUnlock()
+		return db.writer.BatchWriteRecord(entries)
+	}()
 	if err != nil {
-		db.writeCommitMu.RUnlock()
 		return err
 	}
+	// Metrics and index only after the batch write succeeds.
 	idx := db.index.Load()
-	for i, entry := range entries {
-		db.metrics.Add(entry.Key)
-		idx.Set(entry.Key, offsets[i])
-	}
-	db.writeCommitMu.RUnlock()
-
-	for _, entry := range entries {
-		db.cache.Delete(entry.Key)
+	for i := range entries {
+		db.metrics.Add(entries[i].Key)
+		idx.SetIfNewer(entries[i].Key, offsets[i])
+		db.cache.Delete(entries[i].Key)
 	}
 	return nil
 }
@@ -509,12 +680,9 @@ func (db *DB) Flush() error {
 
 	if wal := db.wal.Load(); wal != nil {
 		wal.Close()
-		walPath := db.config.FilePath + ".wal"
+		walPath := db.config.FilePath + storage.FilenameSuffixWAL
 		os.Remove(walPath)
-		newWal, err := storage.NewWAL(&storage.WALConfig{
-			Path:       walPath,
-			BufferSize: db.config.WALMaxBufSize,
-		})
+		newWal, err := storage.NewWAL(newWALConfig(db.config, walPath))
 		if err != nil {
 			return err
 		}
@@ -524,21 +692,29 @@ func (db *DB) Flush() error {
 }
 
 // Compact rewrites the storage file, removing deleted records and reducing fragmentation.
-// It creates a temporary file, copies all live records without holding any locks,
-// then takes the write-commit lock to drain in-flight writers, copies any records
-// written during the first pass, atomically swaps the storage and index pointers,
-// and renames the temp file synchronously.
+// It snapshots live entries, copies records to a temporary file concurrently with
+// traffic, drains writers, copies anything appended during the copy phase,
+// reconciles entries deleted in the meantime, and only then renames the temp
+// file into place (backup-first) before swapping pointers — a crash at any
+// point leaves a valid database or a recoverable backup, never a half-renamed
+// pair.
 func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
 
 	idx := db.index.Load()
 	if idx.Len() == 0 {
 		return nil
 	}
 
-	tmpPath := db.config.FilePath + ".compact"
+	mainPath := db.config.FilePath
+	backupPath := mainPath + storage.FilenameSuffixBackup
+	tmpPath := mainPath + storage.FilenameSuffixCompact
 	_ = os.Remove(tmpPath)
+	_ = os.Remove(backupPath)
 
 	oldStorage := db.storage.Load()
 	tmpStoreCfg := storage.DefaultFileConfig(tmpPath)
@@ -555,7 +731,17 @@ func (db *DB) Compact() error {
 	oldIndex := db.index.Load()
 	snapshotOffset := oldStorage.LogicalSize()
 
-	// Phase 1: copy records written before the snapshot offset without any lock.
+	copyRecord := func(key, value []byte) bool {
+		newOff, err := tmpStore.WriteRecord(key, value)
+		if err != nil {
+			return false
+		}
+		newIndex.Set(key, newOff)
+		return true
+	}
+
+	// Phase 1: copy records written before the snapshot offset without a
+	// lock. Entries deleted during this phase are reconciled below.
 	oldIndex.Range(func(key []byte, offset int64) bool {
 		if offset >= snapshotOffset {
 			return true
@@ -564,11 +750,9 @@ func (db *DB) Compact() error {
 		if err != nil || tombstone {
 			return true
 		}
-		newOff, err := tmpStore.WriteRecord(key, value)
-		if err != nil {
+		if !copyRecord(key, value) {
 			return false
 		}
-		newIndex.Set(key, newOff)
 		return true
 	})
 
@@ -590,11 +774,9 @@ func (db *DB) Compact() error {
 		if err != nil || tombstone {
 			return true
 		}
-		newOff, err := tmpStore.WriteRecord(key, value)
-		if err != nil {
+		if !copyRecord(key, value) {
 			return false
 		}
-		newIndex.Set(key, newOff)
 		return true
 	})
 
@@ -605,10 +787,39 @@ func (db *DB) Compact() error {
 		return err
 	}
 
-	// Set the logical size so new writes start at the right cursor position.
-	tmpStore.SetLogicalSize(tmpStore.LogicalSize())
+	// Reconcile deletes: keys copied in phase 1 that were deleted while the
+	// copy ran are gone from oldIndex by now; without this pass they would
+	// be resurrected by the new index.
+	newIndex.Range(func(key []byte, offset int64) bool {
+		if offset < snapshotOffset && !oldIndex.Has(key) {
+			newIndex.Delete(key)
+		}
+		return true
+	})
 
-	// Atomically swap — all writers now blocked by writeCommitMu.Lock.
+	// Crash-safe file replacement runs while writers are still blocked:
+	// main → backup, tmp → main. Pointers swap only after that succeeds;
+	// a failed rename rolls back to the old file untouched.
+	if err := upgradeRename(mainPath, backupPath); err != nil {
+		db.writeCommitMu.Unlock()
+		db.logger.Fields("error", err).Error("compaction: backup rename failed; main file untouched")
+		_ = tmpStore.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := upgradeRename(tmpPath, mainPath); err != nil {
+		// Roll back so the database keeps serving the old file.
+		if rbErr := upgradeRename(backupPath, mainPath); rbErr != nil {
+			db.logger.Fields("error", rbErr).Error("compaction: rollback ALSO failed; recover main data from " + backupPath)
+		}
+		db.writeCommitMu.Unlock()
+		_ = oldStorage.Close()
+		_ = tmpStore.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	// Atomic pointer swap — writers resume against the compacted file.
 	db.writer.store.Store(tmpStore)
 	db.storage.Store(tmpStore)
 	db.index.Store(newIndex)
@@ -616,20 +827,35 @@ func (db *DB) Compact() error {
 
 	db.writeCommitMu.Unlock()
 
-	// Close and replace the old file synchronously so errors are surfaced.
+	// Old storage (now the backup) is out of the pointer path — close it.
 	if err := oldStorage.Close(); err != nil {
 		db.logger.Fields("error", err).Error("compaction: close old storage failed")
 	}
-	if err := os.Remove(db.config.FilePath); err != nil {
-		db.logger.Fields("error", err).Error("compaction: remove old file failed")
-	}
-	if err := os.Rename(tmpPath, db.config.FilePath); err != nil {
-		db.logger.Fields("error", err).Error("compaction: rename failed")
-		return err
-	}
+	_ = os.Remove(backupPath)
+	fsyncDir(mainPath)
 
 	db.logger.Fields("live_keys", newIndex.Len()).Info("compaction completed")
 	return nil
+}
+
+// upgradeRename renames src over the dst path, tolerating a missing dst.
+func upgradeRename(src, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fsyncDir flushes directory metadata (rename/create durability).
+// Failure is non-fatal on filesystems that forbid directory fsync.
+func fsyncDir(path string) {
+	dir := filepath.Dir(path)
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // CompactIfNeeded checks whether fragmentation exceeds the configured threshold.
@@ -640,15 +866,21 @@ func (db *DB) CompactIfNeeded() error {
 		return nil
 	}
 	store := db.storage.Load()
-	avgRecordSize := store.Size() / int64(idx.Len())
-	estimatedLive := int64(idx.Len()) * avgRecordSize
-	fragmentation := float64(store.Size()-estimatedLive) / float64(store.Size())
+	// Use the logical (live-record) extent — the allocated size includes
+	// pre-allocation padding and the writer's growth factor, which are not
+	// fragmentation and would trigger spurious compactions.
+	logical := store.LogicalSize()
+	if logical <= 0 {
+		return nil
+	}
+	estimatedLive := int64(idx.Len()) * (logical / int64(idx.Len()))
+	fragmentation := 1 - float64(estimatedLive)/float64(logical)
 	if fragmentation > db.config.CompactionFragmentation {
 		db.logger.Fields(
 			"fragmentation", fragmentation,
 			"threshold", db.config.CompactionFragmentation,
 			"live_bytes", estimatedLive,
-			"total_bytes", store.Size(),
+			"logical_bytes", logical,
 		).Info("compaction triggered")
 		return db.Compact()
 	}
@@ -804,7 +1036,7 @@ func (db *DB) GetBucket(name string) *Bucket {
 	prefix := make([]byte, 0, len(name)+1)
 	if name != "" {
 		prefix = append(prefix, name...)
-		prefix = append(prefix, 0x00)
+		prefix = append(prefix, bucketKeySeparator[0])
 	}
 	return &Bucket{
 		name:   name,
@@ -836,6 +1068,9 @@ func (db *DB) Close() error {
 		}
 		if db.ownPool && db.pool != nil {
 			db.pool.Shutdown(30 * time.Second)
+		}
+		if db.lockFile != nil {
+			_ = db.lockFile.Close()
 		}
 	})
 	return err

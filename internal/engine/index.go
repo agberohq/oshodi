@@ -15,8 +15,10 @@ type Index struct {
 // NewIndex creates a new index with the given Bloom filter parameters.
 func NewIndex(expectedItems uint, falsePositiveRate float64) *Index {
 	return &Index{
-		shards: mappo.NewSharded[string, int64](),
-		bloom:  metrics.NewBloomFilter(expectedItems, falsePositiveRate),
+		shards: mappo.NewShardedWithConfig[string, int64](mappo.ShardedConfig{
+			ShardCount: 128,
+		}),
+		bloom: metrics.NewBloomFilter(expectedItems, falsePositiveRate),
 	}
 }
 
@@ -24,6 +26,31 @@ func NewIndex(expectedItems uint, falsePositiveRate float64) *Index {
 func (idx *Index) Set(key []byte, offset int64) {
 	idx.shards.Set(string(key), offset)
 	idx.bloom.Add(key)
+}
+
+// SetIfNewer stores offset only when the key is absent or the incoming
+// offset is newer — offsets come from one atomic counter, so a higher
+// offset is always a later write. This keeps last-writer-wins true when
+// concurrent writers commit index updates outside write order.
+func (idx *Index) SetIfNewer(key []byte, offset int64) {
+	idx.shards.Update(string(key), func(current int64, exists bool) int64 {
+		if exists && current > offset {
+			return current
+		}
+		return offset
+	})
+	idx.bloom.Add(key)
+}
+
+// DeleteIfStale removes the key's index entry unless a newer write
+// (offset > tombstoneOffset) is already recorded.
+func (idx *Index) DeleteIfStale(key []byte, tombstoneOffset int64) {
+	idx.shards.Compute(string(key), func(current int64, exists bool) (int64, bool) {
+		if exists && current > tombstoneOffset {
+			return current, true // keep: a newer Set beats this tombstone
+		}
+		return 0, false
+	})
 }
 
 // Get returns the offset for a key. The boolean indicates existence.
@@ -46,6 +73,12 @@ func (idx *Index) Len() int {
 	return idx.shards.Len()
 }
 
+// Has reports whether a key currently has an index entry.
+func (idx *Index) Has(key []byte) bool {
+	_, ok := idx.shards.Get(string(key))
+	return ok
+}
+
 // BloomInsertions returns the number of insertions into the Bloom filter.
 func (idx *Index) BloomInsertions() uint64 {
 	return idx.bloom.Insertions()
@@ -63,4 +96,22 @@ func (idx *Index) Range(fn func(key []byte, offset int64) bool) {
 	idx.shards.Range(func(k string, v int64) bool {
 		return fn([]byte(k), v)
 	})
+}
+
+// Scan iterates over all keys in arbitrary order, supporting error propagation.
+// The function receives a copy of the key and its offset.
+// Return an error from the callback to abort the scan.
+func (idx *Index) Scan(fn func(key []byte, offset int64) error) error {
+	var result error
+	idx.shards.Range(func(k string, v int64) bool {
+		if result != nil {
+			return false
+		}
+		if err := fn([]byte(k), v); err != nil {
+			result = err
+			return false
+		}
+		return true
+	})
+	return result
 }

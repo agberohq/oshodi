@@ -121,8 +121,7 @@ func TestShardedWriterWriteTombstone(t *testing.T) {
 		t.Fatalf("failed to create writer: %v", err)
 	}
 	key := []byte("test-key")
-	err = writer.WriteTombstone(key)
-	if err != nil {
+	if _, err = writer.WriteTombstone(key); err != nil {
 		t.Fatalf("write tombstone failed: %v", err)
 	}
 	if writer.Offset() <= 0 {
