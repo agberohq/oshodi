@@ -88,10 +88,10 @@ func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks, copyPa
 		logger = ll.New("pubsub").Disable()
 	}
 	return &PubSub{
-		channels: mappo.NewSharded[string, *Channel](),
-		pool:     pool,
-		logger:   logger,
-		hooks:    hooks,
+		channels:    mappo.NewSharded[string, *Channel](),
+		pool:        pool,
+		logger:      logger,
+		hooks:       hooks,
 		copyPayload: copyPayload,
 	}
 }

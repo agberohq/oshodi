@@ -3,8 +3,8 @@ package storage
 import (
 	"context"
 	"encoding/binary"
-	"hash/crc32"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
