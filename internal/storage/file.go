@@ -171,13 +171,25 @@ func (f *File) remapLoop() {
 }
 
 func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verify []byte) (key, value []byte, tombstone bool, n int64, err error) {
-	// Read keyLen first (4 bytes). If zero, we need only 4 more bytes to
-	// distinguish a padding hole from corruption — no key buffer needed.
-	var hdr [4]byte
-	if _, err = reader.ReadAt(hdr[:], offset); err != nil {
+	// The key length is kept in front of the key in one pooled buffer so the
+	// CRC prefix [keyLen | key | valLen | flag] stays contiguous. Keeping it
+	// contiguous avoids the per-read heap allocation that small local arrays
+	// caused when their slices were passed through io.ReaderAt and crc32.
+	bufPtr := metaBufPool.Get().(*[]byte)
+	metaBuf := *bufPtr
+	defer func() {
+		*bufPtr = metaBuf[:0]
+		metaBufPool.Put(bufPtr)
+	}()
+
+	if cap(metaBuf) < 4 {
+		metaBuf = make([]byte, 4)
+	}
+	metaBuf = metaBuf[:4]
+	if _, err = reader.ReadAt(metaBuf, offset); err != nil {
 		return
 	}
-	keyLen := binary.BigEndian.Uint32(hdr[:])
+	keyLen := binary.BigEndian.Uint32(metaBuf)
 	n = 4
 
 	if keyLen > MaxLegalKeyLen {
@@ -185,85 +197,75 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 	}
 
 	if keyLen == 0 {
-		// Padding hole or empty tombstone: read valLen to decide.
-		if _, err = reader.ReadAt(hdr[:], offset+4); err != nil {
+		// Padding hole or empty tombstone: read valLen to decide. The key
+		// length is zero, so the front of the buffer can be reused.
+		if _, err = reader.ReadAt(metaBuf[:4], offset+4); err != nil {
 			return nil, nil, false, n, err
 		}
-		valLen := binary.BigEndian.Uint32(hdr[:])
-		if valLen == 0 {
+		if binary.BigEndian.Uint32(metaBuf[:4]) == 0 {
 			return nil, nil, true, n + 4, nil
 		}
 		return nil, nil, false, n, ErrCorrupt
 	}
 
-	// Read key + valLen(4) + flag(1) in a single call using a pooled buffer.
+	// Read key + valLen(4) + flag(1) in one call, directly behind the key
+	// length prefix already in the buffer.
 	metaSize := int64(keyLen) + 4 + 1
-	metaBufPtr := metaBufPool.Get().(*[]byte)
-	metaBuf := *metaBufPtr
-	if cap(metaBuf) < int(metaSize) {
-		metaBuf = make([]byte, metaSize)
+	prefixLen := 4 + metaSize
+	if int64(cap(metaBuf)) < prefixLen {
+		grown := make([]byte, prefixLen)
+		copy(grown[:4], metaBuf[:4])
+		metaBuf = grown
 	} else {
-		metaBuf = metaBuf[:metaSize]
+		metaBuf = metaBuf[:prefixLen]
 	}
-
-	if _, err = reader.ReadAt(metaBuf, offset+4); err != nil {
-		*metaBufPtr = metaBuf[:0]
-		metaBufPool.Put(metaBufPtr)
+	if _, err = reader.ReadAt(metaBuf[4:], offset+4); err != nil {
 		return nil, nil, false, n, err
 	}
+
+	keyEnd := int64(4) + int64(keyLen)
+	valLen := binary.BigEndian.Uint32(metaBuf[keyEnd : keyEnd+4])
+	if valLen > MaxLegalValLen {
+		return nil, nil, false, n, ErrCorrupt
+	}
+	flag := metaBuf[keyEnd+4]
+	n += int64(keyLen) + 4 + 1 // key + valLen + flag
 
 	// When verify is set the key never materializes: the comparison runs
 	// against the pooled buffer before it is recycled. Otherwise the key is
 	// copied out — the pooled slice may be overwritten by another goroutine
 	// at any time.
-	var verified bool
 	if verify != nil {
-		if !bytes.Equal(metaBuf[:keyLen], verify) {
-			*metaBufPtr = metaBuf[:0]
-			metaBufPool.Put(metaBufPtr)
+		if !bytes.Equal(metaBuf[4:keyEnd], verify) {
 			return nil, nil, false, n, ErrCorrupt
 		}
-		verified = true
 	} else {
-		keyCopy := make([]byte, keyLen)
-		copy(keyCopy, metaBuf[:keyLen])
-		key = keyCopy
+		key = make([]byte, keyLen)
+		copy(key, metaBuf[4:keyEnd])
 	}
-	valLen := binary.BigEndian.Uint32(metaBuf[keyLen : keyLen+4])
-	if valLen > MaxLegalValLen {
-		*metaBufPtr = metaBuf[:0]
-		metaBufPool.Put(metaBufPtr)
-		return nil, nil, false, n, ErrCorrupt
-	}
-	n += int64(keyLen) + 4 + 1 // key length prefix + key + valLen + flag
 
-	flag := metaBuf[keyLen+4]
+	crc := crc32.Checksum(metaBuf[:prefixLen], crc32cTable)
+
 	if valLen == 0 {
-		var crcBuf [RecordCRCSize]byte
-		if _, err = reader.ReadAt(crcBuf[:], offset+4+metaSize); err != nil {
-			*metaBufPtr = metaBuf[:0]
-			metaBufPool.Put(metaBufPtr)
+		// Read the trailer directly behind the prefix in the same buffer.
+		if int64(cap(metaBuf)) < prefixLen+RecordCRCSize {
+			grown := make([]byte, prefixLen+RecordCRCSize)
+			copy(grown, metaBuf[:prefixLen])
+			metaBuf = grown
+		} else {
+			metaBuf = metaBuf[:prefixLen+RecordCRCSize]
+		}
+		if _, err = reader.ReadAt(metaBuf[prefixLen:], offset+prefixLen); err != nil {
 			return nil, nil, false, n, err
 		}
-		// Verify BEFORE recycling the pooled buffer: the CRC covers the key.
-		if err = verifyRecordFooter(metaBuf[:keyLen], 0, flag, nil, asCRC4(crcBuf[:])); err != nil {
-			*metaBufPtr = metaBuf[:0]
-			metaBufPool.Put(metaBufPtr)
-			return nil, nil, false, n, err
+		if binary.BigEndian.Uint32(metaBuf[prefixLen:]) != crc {
+			return nil, nil, false, n, ErrCorrupt
 		}
-		*metaBufPtr = metaBuf[:0]
-		metaBufPool.Put(metaBufPtr)
 		n += RecordCRCSize
 		switch flag {
 		case RecordFlagTombstone:
-			if verified {
-				return nil, nil, true, n, nil
-			}
 			return key, nil, true, n, nil
 		case RecordFlagEmptyValue:
-			if verified {
-				return nil, nil, false, n, nil
-			}
 			return key, nil, false, n, nil
 		default:
 			return nil, nil, false, n, ErrCorrupt
@@ -279,21 +281,14 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 	} else {
 		value = make([]byte, readSize)
 	}
-	if _, err = reader.ReadAt(value, offset+4+metaSize); err != nil {
-		*metaBufPtr = metaBuf[:0]
-		metaBufPool.Put(metaBufPtr)
+	if _, err = reader.ReadAt(value, offset+prefixLen); err != nil {
 		return nil, nil, false, n, err
 	}
 	n += readSize
 
-	// Verify BEFORE recycling the pooled buffer: the CRC covers the key.
-	if err = verifyRecordFooter(metaBuf[:keyLen], valLen, flag, value[:valLen], asCRC4(value[valLen:readSize])); err != nil {
-		*metaBufPtr = metaBuf[:0]
-		metaBufPool.Put(metaBufPtr)
-		return nil, nil, false, n, err
+	if crc32.Update(crc, crc32cTable, value[:valLen]) != binary.BigEndian.Uint32(value[valLen:]) {
+		return nil, nil, false, n, ErrCorrupt
 	}
-	*metaBufPtr = metaBuf[:0]
-	metaBufPool.Put(metaBufPtr)
 
 	if compressed {
 		if f.compressor == nil {
@@ -303,44 +298,62 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 		if err != nil {
 			return nil, nil, false, n, err
 		}
-		if verified {
-			return nil, value, false, n, nil
-		}
 		return key, value, false, n, nil
-	}
-
-	if verified {
-		return nil, value[:valLen], false, n, nil
 	}
 	return key, value[:valLen], false, n, nil
 }
 
-// verifyRecordFooter computes the CRC-Castagnoli over the serialized record
-// [keyLen(4BE) | key | valLen(4BE) | flag | value] and compares against the
-// stored trailer. key must be the stored (possibly compressed) payload bytes.
-func verifyRecordFooter(key []byte, valLen uint32, flag byte, value []byte, stored [4]byte) error {
-	var scratch [8]byte
-
-	binary.BigEndian.PutUint32(scratch[:4], uint32(len(key)))
-	crc := crc32.Checksum(scratch[:4], crc32cTable)
-	crc = crc32.Update(crc, crc32cTable, key)
-	binary.BigEndian.PutUint32(scratch[:4], valLen)
-	crc = crc32.Update(crc, crc32cTable, scratch[:4])
-	scratch[0] = flag
-	crc = crc32.Update(crc, crc32cTable, scratch[:1])
-	if len(value) > 0 {
-		crc = crc32.Update(crc, crc32cTable, value)
+// readRecordShared reads through the current mmap when possible and falls
+// back to the file descriptor otherwise. On a stale mapping (a read past the
+// last remap after an append) it refreshes the mapping once and retries,
+// instead of paying a failed mmap read, an allocated error and an fd read for
+// every record in a scan.
+func (f *File) readRecordShared(off int64, dstBuf, verify []byte) (key, value []byte, tombstone bool, n int64, err error) {
+	f.mmapMu.RLock()
+	mm := f.mmap.Load()
+	if mm == nil {
+		f.mmapMu.RUnlock()
+		return f.readRecord(f.file, off, dstBuf, verify)
 	}
-	if binary.BigEndian.Uint32(stored[:]) != crc {
-		return ErrCorrupt
+	key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify)
+	f.mmapMu.RUnlock()
+	if err == nil || errors.Is(err, ErrCorrupt) {
+		return
 	}
-	return nil
+	if f.refreshMmap() {
+		f.mmapMu.RLock()
+		if mm = f.mmap.Load(); mm != nil {
+			key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify)
+		}
+		f.mmapMu.RUnlock()
+		if err == nil || errors.Is(err, ErrCorrupt) {
+			return
+		}
+	}
+	return f.readRecord(f.file, off, dstBuf, verify)
 }
 
-// asCRC4 copies a stored 4-byte CRC trailer into a fixed-size array.
-func asCRC4(src []byte) (out [4]byte) {
-	copy(out[:], src)
-	return
+// refreshMmap remaps only when the logical extent has grown past what is
+// mapped. Callers must not hold mmapMu.
+func (f *File) refreshMmap() bool {
+	if f.closed.Load() || f.logicalSize.Load() <= f.mappedSize.Load() {
+		return false
+	}
+	if err := f.remap(); err != nil {
+		return false
+	}
+	if f.closed.Load() {
+		// Close won the race after the remap; release the mapping we just
+		// installed instead of leaking it on a closed File.
+		f.mmapMu.Lock()
+		if mm := f.mmap.Load(); mm != nil {
+			_ = mm.Close()
+			f.mmap.Store(nil)
+		}
+		f.mmapMu.Unlock()
+		return false
+	}
+	return true
 }
 
 // ReadValueAt is the hot-path reader: verifies the stored key against the
@@ -350,26 +363,7 @@ func (f *File) ReadValueAt(off int64, key []byte, dstBuf []byte) ([]byte, error)
 	if f.closed.Load() {
 		return nil, ErrClosed
 	}
-
-	f.mmapMu.RLock()
-	mm := f.mmap.Load()
-	if mm != nil {
-		_, rVal, tombstone, _, err := f.readRecord(mm, off, dstBuf, key)
-		f.mmapMu.RUnlock()
-		// err == nil implies the stored key matched (verified inside
-		// readRecord); any other outcome retries through the fd path —
-		// a stale/too-small mmap must not surface as an error.
-		if err == nil {
-			if tombstone {
-				return nil, ErrCorrupt
-			}
-			return rVal, nil
-		}
-	} else {
-		f.mmapMu.RUnlock()
-	}
-
-	_, rVal, tombstone, _, err := f.readRecord(f.file, off, dstBuf, key)
+	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key)
 	if err != nil {
 		return nil, err
 	}
@@ -379,35 +373,17 @@ func (f *File) ReadValueAt(off int64, key []byte, dstBuf []byte) ([]byte, error)
 	return rVal, nil
 }
 
-// ReadAt reads a value record at offset, utilizing a destination buffer to avoid allocations.
+// ReadAt reads a value record at offset, utilizing a destination buffer to
+// avoid allocations. The key is verified inside readRecord.
 func (f *File) ReadAt(off int64, key []byte, dstBuf []byte) ([]byte, error) {
 	if f.closed.Load() {
 		return nil, ErrClosed
 	}
-
-	f.mmapMu.RLock()
-	mm := f.mmap.Load()
-	if mm != nil {
-		_, rVal, tombstone, _, err := f.readRecord(mm, off, dstBuf, key)
-		f.mmapMu.RUnlock()
-		// err == nil already implies the stored key matched (verified
-		// inside readRecord); matching is retried through the fd path
-		// only when the mmap read failed outright.
-		if err == nil && !tombstone {
-			return rVal, nil
-		}
-	} else {
-		f.mmapMu.RUnlock()
-	}
-
-	rKey, rVal, tombstone, _, err := f.readRecord(f.file, off, dstBuf, key)
+	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key)
 	if err != nil {
 		return nil, err
 	}
 	if tombstone {
-		return nil, ErrCorrupt
-	}
-	if !bytes.Equal(rKey, key) {
 		return nil, ErrCorrupt
 	}
 	return rVal, nil
@@ -417,20 +393,7 @@ func (f *File) ReadRecordAt(offset int64) (key, value []byte, tombstone bool, n 
 	if f.closed.Load() {
 		return nil, nil, false, 0, ErrClosed
 	}
-
-	f.mmapMu.RLock()
-	mm := f.mmap.Load()
-	if mm != nil {
-		k, v, ts, sz, e := f.readRecord(mm, offset, nil, nil)
-		f.mmapMu.RUnlock()
-		if e == nil {
-			return k, v, ts, sz, nil
-		}
-	} else {
-		f.mmapMu.RUnlock()
-	}
-
-	return f.readRecord(f.file, offset, nil, nil)
+	return f.readRecordShared(offset, nil, nil)
 }
 
 // WriteAtomic uses the Offset Reservation Pattern (lock-free in the common case).

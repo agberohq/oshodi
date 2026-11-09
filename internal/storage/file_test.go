@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -418,5 +419,52 @@ func TestNextRecordStartSkipsZeroPrefix(t *testing.T) {
 	}
 	if _, ok := f.NextRecordStart(0, f.LogicalSize()); ok {
 		t.Fatal("corrupt record accepted as a valid record start")
+	}
+}
+
+// TestReadAfterGrowthRefreshesMmap pins the stale-mapping fix: a read of a
+// record appended after the last remap must refresh the mapping rather than
+// fail through mmap and fall back to the fd for every record.
+func TestReadAfterGrowthRefreshesMmap(t *testing.T) {
+	cfg := DefaultFileConfig(filepath.Join(t.TempDir(), "grow.db"))
+	cfg.InitialSize = 1024
+	f, err := NewFile(cfg)
+	if err != nil {
+		t.Fatalf("new file: %v", err)
+	}
+	defer f.Close()
+
+	const records = 64
+	value := bytes.Repeat([]byte("v"), 256)
+	type rec struct {
+		key string
+		off int64
+	}
+	var written []rec
+	for i := 0; i < records; i++ {
+		k := []byte(fmt.Sprintf("key-%03d", i))
+		off, err := f.WriteRecord(k, value)
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		written = append(written, rec{key: string(k), off: off})
+	}
+	if f.LogicalSize() <= 1024 {
+		t.Fatalf("test did not grow the file (logical=%d)", f.LogicalSize())
+	}
+
+	// The mapping is still the 1 KiB one from open; every read below is past
+	// it and must trigger the refresh path.
+	for _, r := range written {
+		got, err := f.ReadValueAt(r.off, []byte(r.key), nil)
+		if err != nil {
+			t.Fatalf("read %q at %d: %v", r.key, r.off, err)
+		}
+		if !bytes.Equal(got, value) {
+			t.Fatalf("value for %q corrupted after remap", r.key)
+		}
+	}
+	if f.mappedSize.Load() < f.LogicalSize() {
+		t.Fatalf("mapping not refreshed: mapped=%d logical=%d", f.mappedSize.Load(), f.LogicalSize())
 	}
 }
