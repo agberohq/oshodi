@@ -1,3 +1,5 @@
 .idea
 lab
 tmp
+_*
+.DS_Store
