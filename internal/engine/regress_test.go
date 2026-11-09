@@ -10,7 +10,7 @@ import (
 	"github.com/agberohq/oshodi/internal/storage"
 )
 
-// ---- C1 regression: BatchSet + compression must decode correctly ----
+// C1 regression: BatchSet + compression must decode correctly
 
 func TestBatchSetWithCompressionRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -60,7 +60,7 @@ func TestBatchSetWithCompressionRoundTrip(t *testing.T) {
 	}
 }
 
-// ---- C3 regression: empty values are first-class, never deletes ----
+// C3 regression: empty values are first-class, never deletes
 
 func TestEmptyValueSurvivesRestart(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -135,7 +135,7 @@ func TestSetThenDeleteStaysDeletedAcrossRestart(t *testing.T) {
 	}
 }
 
-// ---- C4 regression: same-key writers must not leave a stale index ----
+// C4 regression: same-key writers must not leave a stale index
 
 func TestConcurrentSameKeyWritesAlwaysReadLatest(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -162,7 +162,7 @@ func TestConcurrentSameKeyWritesAlwaysReadLatest(t *testing.T) {
 	}
 }
 
-// ---- C5 regression: delete during compaction must not resurrect ----
+// C5 regression: delete during compaction must not resurrect
 
 func TestCompactWithDeletesNoResurrection(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -209,7 +209,7 @@ func TestCompactWithDeletesNoResurrection(t *testing.T) {
 	}
 }
 
-// ---- R3 regression: oversized keys rejected, never OOM-parsed ----
+// R3 regression: oversized keys rejected, never OOM-parsed
 
 func TestMaxKeySizeEnforced(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -230,7 +230,7 @@ func TestMaxKeySizeEnforced(t *testing.T) {
 	}
 }
 
-// ---- WAL end-to-end: tombstone sentinel replay + WAL rotation ----
+// WAL end-to-end: tombstone sentinel replay + WAL rotation
 
 func TestWALTombstoneAndEmptyValueReplay(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -282,7 +282,7 @@ func TestWALTombstoneAndEmptyValueReplay(t *testing.T) {
 	}
 }
 
-// ---- WAL copy-on-write: caller mutating its buffer must not corrupt records ----
+// WAL copy-on-write: caller mutating its buffer must not corrupt records
 
 func TestWALCallerBufferMutationSafe(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -337,7 +337,7 @@ func TestWALCallerBufferMutationSafe(t *testing.T) {
 	}
 }
 
-// ---- R1 regression: torn WAL tail truncates instead of failing open ----
+// R1 regression: torn WAL tail truncates instead of failing open
 
 func TestWALTornTailTolerated(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -380,5 +380,388 @@ func TestWALTornTailTolerated(t *testing.T) {
 	defer wal2.Close()
 	if wal2.Size() == 0 {
 		t.Fatal("healthy records were discarded by torn-tail handling")
+	}
+}
+
+// C3 regression: a preallocated zero prefix must not hide the catalogue
+
+// TestOpenIndexesRecordsAfterZeroPrefix pins the muca incident: a run that
+// preallocated the file and exited before its first write left a zero prefix;
+// records appended after it must be indexed on open, not treated as an empty
+// database.
+func TestOpenIndexesRecordsAfterZeroPrefix(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+
+	// Build a healthy record region, then transplant it behind a zero prefix.
+	src, err := NewDB(&Config{FilePath: srcPath, DisableWAL: true, InitialFileSize: 1 << 20})
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	for _, kv := range []struct{ k, v string }{
+		{"songs\x00testing", `{"title":"Testing"}`},
+		{"songs\x00june-express-v2", `{"title":"June Express V2"}`},
+	} {
+		if err := src.Set([]byte(kv.k), []byte(kv.v)); err != nil {
+			t.Fatalf("seed %q: %v", kv.k, err)
+		}
+	}
+	logical := src.storage.Load().LogicalSize()
+	if err := src.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
+	raw, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+
+	const prefix = 1 << 20
+	dstPath := filepath.Join(dir, "muca.db")
+	damaged := append(make([]byte, prefix), raw...)
+	if err := os.WriteFile(dstPath, damaged, 0o600); err != nil {
+		t.Fatalf("write damaged db: %v", err)
+	}
+
+	db, err := NewDB(&Config{FilePath: dstPath, DisableWAL: true})
+	if err != nil {
+		t.Fatalf("open damaged: %v", err)
+	}
+	if got := db.Stats().NumKeys; got != 2 {
+		t.Fatalf("keys after reopen = %d, want 2", got)
+	}
+	if got := db.storage.Load().LogicalSize(); got != prefix+logical {
+		t.Fatalf("write cursor = %d, want %d (last record boundary)", got, prefix+logical)
+	}
+	if v, err := db.Get([]byte("songs\x00testing")); err != nil || !bytes.Contains(v, []byte("Testing")) {
+		t.Fatalf("get recovered record: %v %q", err, v)
+	}
+
+	// New writes append at the recovered boundary and survive another reopen.
+	if err := db.Set([]byte("songs\x00later"), []byte(`{"title":"Later"}`)); err != nil {
+		t.Fatalf("set after recovery: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db, err = NewDB(&Config{FilePath: dstPath, DisableWAL: true})
+	if err != nil {
+		t.Fatalf("reopen after write: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().NumKeys; got != 3 {
+		t.Fatalf("keys after second reopen = %d, want 3", got)
+	}
+}
+
+// TestOpenPreallocatedEmptyStartsAtZero covers the origin of the incident: an
+// empty preallocated file must reset the write cursor to offset 0 so records
+// never land behind a zero prefix in the first place.
+func TestOpenPreallocatedEmptyStartsAtZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.db")
+	const initial = 1 << 20
+	if err := os.WriteFile(path, make([]byte, initial), 0o600); err != nil {
+		t.Fatalf("seed preallocated file: %v", err)
+	}
+
+	db, err := NewDB(&Config{FilePath: path, DisableWAL: true, InitialFileSize: initial})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got := db.storage.Load().LogicalSize(); got != 0 {
+		t.Fatalf("write cursor = %d, want 0 for an all-zero file", got)
+	}
+	if err := db.Set([]byte("songs\x00first"), []byte(`{"title":"First"}`)); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if off, ok := db.index.Load().Get([]byte("songs\x00first")); !ok || off != 0 {
+		t.Fatalf("first record offset = %d ok=%v, want 0", off, ok)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err = NewDB(&Config{FilePath: path, DisableWAL: true})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	if got := db.Stats().NumKeys; got != 1 {
+		t.Fatalf("keys after reopen = %d, want 1", got)
+	}
+	if got := db.storage.Load().LogicalSize(); got >= initial {
+		t.Fatalf("write cursor = %d, still behind the preallocated region", got)
+	}
+}
+
+// C4 regression: recovery boundaries
+
+// validRecordEnds returns the end offset of every contiguous, valid record at
+// the start of path. It stops at the first hole or unreadable record.
+func validRecordEnds(t *testing.T, path string) []int64 {
+	t.Helper()
+	st, err := storage.NewFile(&storage.FileConfig{Path: path})
+	if err != nil {
+		t.Fatalf("open raw storage: %v", err)
+	}
+	defer st.Close()
+	var ends []int64
+	var off int64
+	for {
+		key, _, tomb, n, err := st.ReadRecordAt(off)
+		if err != nil || n == 0 {
+			break
+		}
+		if tomb && len(key) == 0 {
+			break
+		}
+		off += n
+		ends = append(ends, off)
+	}
+	return ends
+}
+
+func seedTwoRecords(t *testing.T, dir string) (path string, raw []byte, ends []int64) {
+	t.Helper()
+	path = filepath.Join(dir, "src.db")
+	db, err := NewDB(&Config{FilePath: path, DisableWAL: true, InitialFileSize: 1 << 20})
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	for _, kv := range []struct{ k, v string }{
+		{"songs\x00alpha", `{"title":"Alpha"}`},
+		{"songs\x00beta", `{"title":"Beta"}`},
+	} {
+		if err := db.Set([]byte(kv.k), []byte(kv.v)); err != nil {
+			t.Fatalf("seed %q: %v", kv.k, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("seed close: %v", err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+	ends = validRecordEnds(t, path)
+	if len(ends) != 2 {
+		t.Fatalf("seed records = %d, want 2", len(ends))
+	}
+	return path, raw, ends
+}
+
+func openKeys(t *testing.T, path string) (*DB, map[string]bool) {
+	t.Helper()
+	db, err := NewDB(&Config{FilePath: path, DisableWAL: true})
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	keys := map[string]bool{}
+	for _, k := range []string{"songs\x00alpha", "songs\x00beta", "songs\x00gamma"} {
+		if _, err := db.Get([]byte(k)); err == nil {
+			keys[k] = true
+		}
+	}
+	return db, keys
+}
+
+// TestOpenRecoversMultipleZeroRegions: a zero prefix is not only a leading
+// artifact; holes between valid records (interrupted growth, sparse writes)
+// must be skipped without stopping the scan.
+func TestOpenRecoversMultipleZeroRegions(t *testing.T) {
+	dir := t.TempDir()
+	_, raw, ends := seedTwoRecords(t, dir)
+
+	const prefix, gap = 1 << 20, 64 << 10
+	target := filepath.Join(dir, "multi.db")
+	var buf []byte
+	buf = append(buf, make([]byte, prefix)...)
+	buf = append(buf, raw[:ends[0]]...)
+	buf = append(buf, make([]byte, gap)...)
+	buf = append(buf, raw[ends[0]:ends[1]]...)
+	buf = append(buf, make([]byte, prefix)...)
+	if err := os.WriteFile(target, buf, 0o600); err != nil {
+		t.Fatalf("write damaged db: %v", err)
+	}
+
+	db, keys := openKeys(t, target)
+	defer db.Close()
+	if !keys["songs\x00alpha"] || !keys["songs\x00beta"] {
+		t.Fatalf("recovered keys = %v, want both records", keys)
+	}
+	want := int64(prefix+gap) + ends[1]
+	if got := db.storage.Load().LogicalSize(); got != want {
+		t.Fatalf("logical size = %d, want %d", got, want)
+	}
+}
+
+// TestOpenTrimsAtCorruptRecord pins the safe boundary: recovery stops at the
+// first unreadable record instead of skipping a mutation and resurrecting
+// later (possibly stale) records.
+func TestOpenTrimsAtCorruptRecord(t *testing.T) {
+	dir := t.TempDir()
+	_, raw, ends := seedTwoRecords(t, dir)
+
+	bad := append([]byte(nil), raw...)
+	bad[ends[0]+5] ^= 0xFF // corrupt the second record's payload
+	target := filepath.Join(dir, "bitrot.db")
+	if err := os.WriteFile(target, bad, 0o600); err != nil {
+		t.Fatalf("write bitrot db: %v", err)
+	}
+
+	db, keys := openKeys(t, target)
+	if keys["songs\x00beta"] {
+		t.Fatalf("bit-rotted record was indexed: %v", keys)
+	}
+	if !keys["songs\x00alpha"] {
+		t.Fatalf("healthy prefix lost: %v", keys)
+	}
+	if got := db.storage.Load().LogicalSize(); got != ends[0] {
+		t.Fatalf("logical size = %d, want trim at %d", got, ends[0])
+	}
+	// The next write must land at the trim point, not resurrect the record.
+	if err := db.Set([]byte("songs\x00gamma"), []byte(`{"title":"Gamma"}`)); err != nil {
+		t.Fatalf("set after bit rot: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db, keys = openKeys(t, target)
+	defer db.Close()
+	if keys["songs\x00beta"] || !keys["songs\x00gamma"] {
+		t.Fatalf("state after rewrite = %v, want alpha+gamma only", keys)
+	}
+}
+
+// TestOpenTrimsTornTail: a partial trailing record is discarded, earlier
+// records survive, and the next write starts at the last good boundary.
+func TestOpenTrimsTornTail(t *testing.T) {
+	dir := t.TempDir()
+	_, raw, ends := seedTwoRecords(t, dir)
+
+	cut := ends[0] + (ends[1]-ends[0])/2
+	target := filepath.Join(dir, "torn.db")
+	if err := os.WriteFile(target, raw[:cut], 0o600); err != nil {
+		t.Fatalf("write torn db: %v", err)
+	}
+
+	db, keys := openKeys(t, target)
+	if keys["songs\x00beta"] || !keys["songs\x00alpha"] {
+		t.Fatalf("after torn tail keys = %v, want alpha only", keys)
+	}
+	if got := db.storage.Load().LogicalSize(); got != ends[0] {
+		t.Fatalf("logical size = %d, want %d", got, ends[0])
+	}
+	if err := db.Set([]byte("songs\x00gamma"), []byte(`{"title":"Gamma"}`)); err != nil {
+		t.Fatalf("set after torn tail: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db, keys = openKeys(t, target)
+	defer db.Close()
+	if keys["songs\x00beta"] || !keys["songs\x00gamma"] {
+		t.Fatalf("state after rewrite = %v, want alpha+gamma only", keys)
+	}
+}
+
+// TestCompactReclaimsZeroPrefix: after recovery, compaction must write the
+// live records from offset 0, dropping the preallocated hole.
+func TestCompactReclaimsZeroPrefix(t *testing.T) {
+	dir := t.TempDir()
+	_, raw, ends := seedTwoRecords(t, dir)
+
+	const prefix = 1 << 20
+	target := filepath.Join(dir, "compact.db")
+	if err := os.WriteFile(target, append(make([]byte, prefix), raw[:ends[1]]...), 0o600); err != nil {
+		t.Fatalf("write damaged db: %v", err)
+	}
+
+	db, keys := openKeys(t, target)
+	if !keys["songs\x00alpha"] || !keys["songs\x00beta"] {
+		t.Fatalf("recovered keys = %v", keys)
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if got := db.storage.Load().LogicalSize(); got != ends[1] {
+		t.Fatalf("logical size after compact = %d, want %d", got, ends[1])
+	}
+	for _, k := range []string{"songs\x00alpha", "songs\x00beta"} {
+		off, ok := db.index.Load().Get([]byte(k))
+		if !ok || off >= prefix {
+			t.Fatalf("compacted offset for %q = %d ok=%v, still behind the prefix", k, off, ok)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db, keys = openKeys(t, target)
+	defer db.Close()
+	if !keys["songs\x00alpha"] || !keys["songs\x00beta"] {
+		t.Fatalf("keys after compact+reopen = %v", keys)
+	}
+}
+
+// TestOpenRecoversInterruptedCompaction covers the crash window between
+// Compact's two renames: the completed .compact file wins over the backup.
+func TestOpenRecoversInterruptedCompaction(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "db")
+
+	mk := func(name string, keys ...string) []byte {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		db, err := NewDB(&Config{FilePath: p, DisableWAL: true, InitialFileSize: 1 << 20})
+		if err != nil {
+			t.Fatalf("build %s: %v", name, err)
+		}
+		for _, k := range keys {
+			if err := db.Set([]byte(k), []byte(k)); err != nil {
+				t.Fatalf("set %s: %v", k, err)
+			}
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close %s: %v", name, err)
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return raw
+	}
+
+	old := mk("old.db", "songs\x00alpha")
+	newer := mk("new.db", "songs\x00alpha", "songs\x00beta")
+
+	// Crash after main -> .bak, before .compact -> main.
+	if err := os.WriteFile(main+storage.FilenameSuffixBackup, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(main+storage.FilenameSuffixCompact, newer, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	db, keys := openKeys(t, main)
+	defer db.Close()
+	if !keys["songs\x00alpha"] || !keys["songs\x00beta"] {
+		t.Fatalf("keys after interrupted compaction = %v, want both", keys)
+	}
+	if _, err := os.Stat(main); err != nil {
+		t.Fatalf("main file not restored: %v", err)
+	}
+	if _, err := os.Stat(main + storage.FilenameSuffixBackup); !os.IsNotExist(err) {
+		t.Fatal("backup not cleaned up after completing compaction")
+	}
+
+	// Crash with only the backup on disk: roll back.
+	main2 := filepath.Join(dir, "db2")
+	if err := os.WriteFile(main2+storage.FilenameSuffixBackup, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db2, keys2 := openKeys(t, main2)
+	defer db2.Close()
+	if !keys2["songs\x00alpha"] || keys2["songs\x00beta"] {
+		t.Fatalf("keys after backup rollback = %v", keys2)
 	}
 }

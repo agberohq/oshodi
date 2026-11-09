@@ -238,6 +238,15 @@ func NewDB(config *Config) (*DB, error) {
 		return nil, err
 	}
 
+	// Finish a compaction that crashed between its two renames before the
+	// storage layer can create a fresh, empty main file in its place.
+	if recovered, recErr := storage.RecoverInterruptedCompaction(config.FilePath); recErr != nil {
+		_ = lockFile.Close()
+		return nil, recErr
+	} else if recovered {
+		config.Logger.Fields("path", config.FilePath).Info("recovered interrupted compaction")
+	}
+
 	storeCfg := storage.DefaultFileConfig(config.FilePath)
 	storeCfg.InitialSize = config.InitialFileSize
 	storeCfg.BufferSize = config.WriterBufferSize
@@ -306,7 +315,14 @@ func NewDB(config *Config) (*DB, error) {
 		db.wal.Store(wal)
 	}
 
-	if store.Size() > 0 && !store.IsEmpty() {
+	// Rebuild the index whenever the file has bytes in it. The first bytes
+	// may be a preallocation hole rather than the first record: a run that
+	// preallocated the file and exited before its first write leaves a zero
+	// prefix, and the next run appends records after it. Gating this on
+	// IsEmpty() (which only inspected offset 0) then skipped the rebuild
+	// forever, so the whole catalogue opened as empty. loadIndex skips the
+	// prefix and sets the write cursor to the last record boundary.
+	if store.Size() > 0 {
 		if err := db.loadIndex(); err != nil {
 			db.Close()
 			return nil, err
@@ -435,9 +451,15 @@ func (db *DB) loadIndex() error {
 		}
 
 		if tombstone && len(key) == 0 {
-			// Padding hole from pre-allocation. Skip the 8-byte sentinel
-			// and continue — do not treat this as end-of-file.
-			offset += n
+			// Preallocation hole. Jump to the next complete record in one
+			// pass instead of stepping through the zero prefix 8 bytes at a
+			// time; records appended after a zero prefix must still be
+			// indexed, not treated as end-of-file.
+			next, ok := store.NextRecordStart(offset+n, limit)
+			if !ok {
+				break
+			}
+			offset = next
 			continue
 		}
 
@@ -740,7 +762,7 @@ func (db *DB) Compact() error {
 		return true
 	}
 
-	// Phase 1: copy records written before the snapshot offset without a
+	// Copy records written before the snapshot offset without holding the
 	// lock. Entries deleted during this phase are reconciled below.
 	oldIndex.Range(func(key []byte, offset int64) bool {
 		if offset >= snapshotOffset {
@@ -762,8 +784,8 @@ func (db *DB) Compact() error {
 		return err
 	}
 
-	// Phase 2: take the write lock to drain in-flight writers, then copy
-	// any records appended after the snapshot (written during phase 1).
+	// Take the write lock to drain in-flight writers, then copy any records
+	// appended after the snapshot (written during the first pass).
 	db.writeCommitMu.Lock()
 
 	oldIndex.Range(func(key []byte, offset int64) bool {

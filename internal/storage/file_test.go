@@ -374,3 +374,49 @@ func BenchmarkFileWriteLargeValue(b *testing.B) {
 		}
 	}
 }
+
+// TestNextRecordStartSkipsZeroPrefix covers index rebuild after a
+// preallocated prefix: the first record must be found behind the zeros, and
+// an all-zero region must report no record.
+func TestNextRecordStartSkipsZeroPrefix(t *testing.T) {
+	cfg := DefaultFileConfig(filepath.Join(t.TempDir(), "gap.db"))
+	cfg.InitialSize = 128 << 10
+	f, err := NewFile(cfg)
+	if err != nil {
+		t.Fatalf("new file: %v", err)
+	}
+	defer f.Close()
+
+	const prefix = 64 << 10
+	if _, err := f.file.WriteAt(make([]byte, prefix), 0); err != nil {
+		t.Fatalf("seed prefix: %v", err)
+	}
+	f.logicalSize.Store(prefix)
+	f.allocatedSize.Store(128 << 10)
+
+	off, err := f.WriteRecord([]byte("songs\x00one"), []byte("v"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if off != prefix {
+		t.Fatalf("record offset = %d, want %d", off, prefix)
+	}
+	if f.IsEmpty() {
+		t.Fatal("file with a record behind the prefix reported empty")
+	}
+	got, ok := f.NextRecordStart(0, f.LogicalSize())
+	if !ok || got != off {
+		t.Fatalf("NextRecordStart = %d ok=%v, want %d", got, ok, off)
+	}
+	if _, ok := f.NextRecordStart(0, prefix); ok {
+		t.Fatal("all-zero prefix reported a record")
+	}
+
+	// A record whose payload no longer matches its CRC must not be returned.
+	if _, err := f.file.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, off+8); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if _, ok := f.NextRecordStart(0, f.LogicalSize()); ok {
+		t.Fatal("corrupt record accepted as a valid record start")
+	}
+}

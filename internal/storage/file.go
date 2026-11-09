@@ -617,22 +617,125 @@ func (f *File) Truncate(size int64) error {
 	return f.remap()
 }
 
-// IsEmpty returns true if no valid records have been written.
+// IsEmpty returns true if no valid record exists in the logical region.
+// A preallocated file whose first bytes are zero padding is not empty if a
+// record was appended after the padding, so this scans rather than trusting
+// offset 0.
 func (f *File) IsEmpty() bool {
 	if f.closed.Load() {
 		return true
 	}
-	if f.logicalSize.Load() == 0 {
+	limit := f.logicalSize.Load()
+	if limit == 0 {
 		return true
 	}
-	key, _, tombstone, _, err := f.readRecord(f.file, 0, nil, nil)
-	if err != nil {
-		return true
+	_, ok := f.NextRecordStart(0, limit)
+	return !ok
+}
+
+// NextRecordStart returns the offset of the first complete, CRC-valid record
+// at or after off, skipping zero padding left by preallocation or interrupted
+// writes. limit is the logical end of the file. ok is false when no record
+// exists in [off, limit).
+//
+// A record begins with a non-zero big-endian key length, so scanning for the
+// first non-zero byte narrows the record start to the four-byte window ending
+// there. Each candidate is CRC-checked, and the value is streamed rather than
+// materialised so a corrupt length prefix cannot force a large allocation.
+func (f *File) NextRecordStart(off, limit int64) (int64, bool) {
+	if off < 0 {
+		off = 0
 	}
-	if tombstone && len(key) == 0 {
-		return true
+	if limit > f.allocatedSize.Load() {
+		limit = f.allocatedSize.Load()
 	}
-	return false
+	p, ok := f.nextNonZero(off, limit)
+	if !ok {
+		return 0, false
+	}
+	start := p - 3
+	if start < off {
+		start = off
+	}
+	for cand := start; cand <= p; cand++ {
+		if f.validRecordAt(cand, limit) {
+			return cand, true
+		}
+	}
+	return 0, false
+}
+
+// nextNonZero returns the offset of the first non-zero byte in [off, limit).
+func (f *File) nextNonZero(off, limit int64) (int64, bool) {
+	const window = 64 << 10
+	buf := make([]byte, window)
+	for off < limit {
+		n := int64(len(buf))
+		if limit-off < n {
+			n = limit - off
+		}
+		m, err := f.file.ReadAt(buf[:n], off)
+		for i := 0; i < m; i++ {
+			if buf[i] != 0 {
+				return off + int64(i), true
+			}
+		}
+		off += int64(m)
+		if err != nil || m == 0 {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// validRecordAt reports whether a complete record at off parses and matches
+// its CRC trailer. The payload is checksummed as a stream, so no allocation
+// is proportional to the declared value length.
+func (f *File) validRecordAt(off, limit int64) bool {
+	if off < 0 || off+4 > limit {
+		return false
+	}
+	var hdr [4]byte
+	if _, err := f.file.ReadAt(hdr[:], off); err != nil {
+		return false
+	}
+	keyLen := int64(binary.BigEndian.Uint32(hdr[:]))
+	if keyLen < 1 || keyLen > int64(MaxLegalKeyLen) {
+		return false
+	}
+	meta := off + 4 + keyLen
+	if meta+5 > limit {
+		return false
+	}
+	var tail [5]byte
+	if _, err := f.file.ReadAt(tail[:], meta); err != nil {
+		return false
+	}
+	valLen := int64(binary.BigEndian.Uint32(tail[:4]))
+	flag := tail[4]
+	if valLen > int64(MaxLegalValLen) {
+		return false
+	}
+	if valLen == 0 {
+		if flag != RecordFlagEmptyValue && flag != RecordFlagTombstone {
+			return false
+		}
+	} else if flag > 1 {
+		return false
+	}
+	payload := 4 + keyLen + 4 + 1 + valLen
+	if payload+RecordCRCSize > limit-off {
+		return false
+	}
+	h := crc32.New(crc32cTable)
+	if _, err := io.CopyN(h, io.NewSectionReader(f.file, off, payload), payload); err != nil {
+		return false
+	}
+	var crcBuf [4]byte
+	if _, err := f.file.ReadAt(crcBuf[:], off+payload); err != nil {
+		return false
+	}
+	return h.Sum32() == binary.BigEndian.Uint32(crcBuf[:])
 }
 
 func (f *File) Close() error {
