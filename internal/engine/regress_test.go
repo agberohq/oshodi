@@ -3,10 +3,12 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/agberohq/oshodi/internal/pipeline"
 	"github.com/agberohq/oshodi/internal/storage"
 )
 
@@ -763,5 +765,121 @@ func TestOpenRecoversInterruptedCompaction(t *testing.T) {
 	defer db2.Close()
 	if !keys2["songs\x00alpha"] || keys2["songs\x00beta"] {
 		t.Fatalf("keys after backup rollback = %v", keys2)
+	}
+}
+
+// TestCompactIfNeededTriggersOnFragmentation pins the compaction threshold:
+// overwriting every key eight times must be recognised as fragmentation and
+// trigger a rewrite. Before the fix the estimate was algebraically equal to
+// the logical size, so fragmentation was always ~0 and this never ran.
+func TestCompactIfNeededTriggersOnFragmentation(t *testing.T) {
+	dir := t.TempDir()
+	db, err := NewDB(&Config{
+		FilePath:                filepath.Join(dir, "frag.db"),
+		DisableWAL:              true,
+		InitialFileSize:         1 << 20,
+		CompactionMinItems:      10,
+		CompactionFragmentation: 0.3,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	for v := 0; v < 8; v++ {
+		for i := 0; i < 20; i++ {
+			k := []byte(fmt.Sprintf("k%02d", i))
+			if err := db.Set(k, bytes.Repeat([]byte{byte('a' + v)}, 64)); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+		}
+	}
+
+	before := db.storage.Load()
+	if err := db.CompactIfNeeded(); err != nil {
+		t.Fatalf("compact if needed: %v", err)
+	}
+	after := db.storage.Load()
+	if after == before {
+		t.Fatal("fragmented database was not compacted")
+	}
+	if after.LogicalSize()*2 >= before.LogicalSize() {
+		t.Fatalf("compaction did not reclaim space: logical %d -> %d", before.LogicalSize(), after.LogicalSize())
+	}
+	if v, err := db.Get([]byte("k00")); err != nil || !bytes.Equal(v, bytes.Repeat([]byte{'h'}, 64)) {
+		t.Fatalf("latest value lost after compaction: %v %q", err, v)
+	}
+}
+
+// TestCompactIfNeededSkipsFreshDB: with no overwrites the sampled live bytes
+// equal the logical extent, so the periodic check must not rewrite the file.
+func TestCompactIfNeededSkipsFreshDB(t *testing.T) {
+	dir := t.TempDir()
+	db, err := NewDB(&Config{
+		FilePath:                filepath.Join(dir, "fresh.db"),
+		DisableWAL:              true,
+		InitialFileSize:         1 << 20,
+		CompactionMinItems:      10,
+		CompactionFragmentation: 0.3,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 20; i++ {
+		if err := db.Set([]byte(fmt.Sprintf("k%02d", i)), bytes.Repeat([]byte("v"), 64)); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+	}
+	before := db.storage.Load()
+	if err := db.CompactIfNeeded(); err != nil {
+		t.Fatalf("compact if needed: %v", err)
+	}
+	if db.storage.Load() != before {
+		t.Fatal("fresh database was compacted unnecessarily")
+	}
+}
+
+// TestGetterHookGetsPrivateCopy: Getter may hand the cache's internal slice
+// to the callback, but an OnRead hook that mutates its input must still only
+// touch a copy. Otherwise a read hook would corrupt the cache for everyone.
+func TestGetterHookGetsPrivateCopy(t *testing.T) {
+	dir := t.TempDir()
+	db, err := NewDB(&Config{
+		FilePath:   filepath.Join(dir, "hook.db"),
+		DisableWAL: true,
+		Hooks: &pipeline.Hooks{OnRead: func(ctx pipeline.HookContext) ([]byte, error) {
+			for i := range ctx.Value {
+				ctx.Value[i] = 'X'
+			}
+			return ctx.Value, nil
+		}},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	key := []byte("songs\x00secret")
+	if err := db.Set(key, []byte("secret")); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	for i := 0; i < 2; i++ { // miss fills the cache, then hit reads it
+		var got string
+		if err := db.Getter(key, func(v []byte) error {
+			got = string(v)
+			return nil
+		}); err != nil {
+			t.Fatalf("Getter %d: %v", i, err)
+		}
+		if got != "XXXXXX" {
+			t.Fatalf("hooked value = %q, want XXXXXX", got)
+		}
+		raw, ok := db.cache.Get(key)
+		if !ok || string(raw) != "secret" {
+			t.Fatalf("cache after hook = %q ok=%v, want secret", raw, ok)
+		}
 	}
 }

@@ -356,6 +356,19 @@ func (b *Bucket) Get(key []byte) ([]byte, error) {
 	return b.inner.Get(key)
 }
 
+// Getter retrieves a value and passes it to fn without making an owned copy.
+// The slice is only valid until fn returns; copy it to retain it, and do not
+// mutate it. Use Get when you need an owned copy.
+func (b *Bucket) Getter(key []byte, fn func(value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	if len(key) == 0 {
+		return ErrKeyNotFound
+	}
+	return b.inner.Getter(key, fn)
+}
+
 // Delete removes a key
 func (b *Bucket) Delete(key []byte) error {
 	if b.db.closed.Load() {
@@ -365,6 +378,30 @@ func (b *Bucket) Delete(key []byte) error {
 		return ErrKeyEmpty
 	}
 	return b.inner.Delete(key)
+}
+
+// Exists reports whether the key is present without reading its value. It is
+// cheaper than Has for existence checks, but an unreadable record is still
+// reported as existing.
+func (b *Bucket) Exists(key []byte) bool {
+	if b.db.closed.Load() || len(key) == 0 {
+		return false
+	}
+	return b.inner.Exists(key)
+}
+
+// BatchDelete removes multiple keys in one batched write. It is much cheaper
+// than calling Delete per key, especially for cascading deletes.
+func (b *Bucket) BatchDelete(keys [][]byte) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	for _, k := range keys {
+		if len(k) == 0 {
+			return ErrKeyEmpty
+		}
+	}
+	return b.inner.BatchDelete(keys)
 }
 
 // Has checks if a key exists
@@ -395,16 +432,26 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 	return b.inner.Scan(fn)
 }
 
-// ScanView iterates over all key-value pairs while reusing its read buffers
+// Scanner iterates over all key-value pairs while reusing its read buffers
 // instead of allocating a copy per record.
 // key and value are backed by buffers reused for the next record, so both are
 // only valid until fn returns. Copy anything that must outlive the callback;
 // use Scan when the callback needs to retain the slices.
-func (b *Bucket) ScanView(fn func(key, value []byte) bool) error {
+func (b *Bucket) Scanner(fn func(key, value []byte) bool) error {
 	if b.db.closed.Load() {
 		return ErrClosed
 	}
-	return b.inner.ScanView(fn)
+	return b.inner.Scanner(fn)
+}
+
+// ScannerE is Scanner with error propagation: context cancellation, storage
+// errors and callback errors all terminate the scan and are returned. key and
+// value are only valid until fn returns.
+func (b *Bucket) ScannerE(ctx context.Context, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScannerE(ctx, fn)
 }
 
 // ScanE is the error-propagating scan: storage read errors, context

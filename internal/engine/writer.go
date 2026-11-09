@@ -297,3 +297,59 @@ func (sw *ShardedWriter) Close() error {
 func (sw *ShardedWriter) Offset() int64 {
 	return sw.store.Load().LogicalSize()
 }
+
+// BatchWriteTombstones appends deletion markers for every key in one atomic
+// write and returns each marker's file offset, so callers can retire index
+// entries in offset order.
+func (sw *ShardedWriter) BatchWriteTombstones(keys [][]byte) ([]int64, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	bufPtr := sw.encoderPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+
+	totalSize := 0
+	for _, k := range keys {
+		totalSize += 4 + len(k) + 4 + 1 + storage.RecordCRCSize
+	}
+	if cap(buf) < totalSize {
+		buf = make([]byte, totalSize)
+	} else {
+		buf = buf[:totalSize]
+	}
+
+	pos := 0
+	for _, k := range keys {
+		keyLen := len(k)
+		payloadSize := 4 + keyLen + 4 + 1
+		binary.BigEndian.PutUint32(buf[pos:], uint32(keyLen))
+		pos += 4
+		copy(buf[pos:], k)
+		pos += keyLen
+		binary.BigEndian.PutUint32(buf[pos:], 0) // zero value length
+		pos += 4
+		buf[pos] = storage.RecordFlagTombstone
+		pos++
+		binary.BigEndian.PutUint32(buf[pos:], storage.RecordChecksum(buf[pos-payloadSize:pos]))
+		pos += storage.RecordCRCSize
+	}
+
+	baseOffset, err := sw.store.Load().WriteAtomic(buf)
+	if err != nil {
+		*bufPtr = buf[:0]
+		sw.encoderPool.Put(bufPtr)
+		return nil, err
+	}
+
+	offsets := make([]int64, len(keys))
+	cur := baseOffset
+	for i, k := range keys {
+		offsets[i] = cur
+		cur += int64(4 + len(k) + 4 + 1 + storage.RecordCRCSize)
+	}
+
+	*bufPtr = buf[:0]
+	sw.encoderPool.Put(bufPtr)
+	return offsets, nil
+}

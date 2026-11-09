@@ -444,7 +444,9 @@ func (db *DB) loadIndex() error {
 	var lastValid int64
 
 	for offset < limit {
-		key, _, tombstone, n, err := store.ReadRecordAt(offset)
+		// Only the key and tombstone state are needed here; ReadKeyAt still
+		// verifies each record's CRC but skips materialising values.
+		key, tombstone, n, err := store.ReadKeyAt(offset)
 		if err != nil {
 			// Unreadable record: stop and trim to the last good boundary.
 			break
@@ -539,8 +541,8 @@ func (db *DB) commitDirect(key, value []byte) error {
 	return nil
 }
 
-// Get retrieves the value for a key. It checks the cache first,
-// then the Bloom filter, the index, and finally reads from storage.
+// Get retrieves an owned copy of the value for a key. It checks the cache
+// first, then the Bloom filter, the index, and finally reads from storage.
 // Reads race with compaction swaps: an index snapshot paired with a
 // storage file that has since been replaced returns a mismatch. That is
 // transient — reload index + storage and retry rather than surfacing a
@@ -580,9 +582,78 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		}
 
 		db.cache.Set(key, val)
-		return db.applyReadHook(key, val)
+		// val aliases the pooled read buffer, which the caller cannot return.
+		// Copy out, then recycle the buffer.
+		out := make([]byte, len(val))
+		copy(out, val)
+		db.cache.Pool.Put(buf)
+		return db.applyReadHook(key, out)
 	}
 	return nil, ErrKeyNotFound
+}
+
+// Getter resolves key and passes its value to fn without making an owned
+// copy. On a cache hit the slice is the cache's immutable buffer; on a miss it
+// is a pooled read buffer. fn must not retain or mutate the slice. When an
+// OnRead hook is configured it receives a private copy, so hooks may still
+// mutate their input safely.
+func (db *DB) Getter(key []byte, fn func(value []byte) error) error {
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
+	if len(key) == 0 {
+		return ErrKeyNotFound
+	}
+	if ok, err := db.cache.View(key, func(raw []byte) error {
+		return db.hookAndCall(key, raw, fn)
+	}); ok {
+		return err
+	}
+
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		idx := db.index.Load()
+		if !idx.MaybeHas(key) {
+			return ErrKeyNotFound
+		}
+		offset, ok := idx.Get(key)
+		if !ok {
+			return ErrKeyNotFound
+		}
+		store := db.storage.Load()
+
+		buf := db.cache.Pool.Get()
+		val, err := store.ReadValueAt(offset, key, buf)
+		if err != nil {
+			db.cache.Pool.Put(buf)
+			if errors.Is(err, storage.ErrCorrupt) || errors.Is(err, storage.ErrClosed) {
+				// Stale index/storage pairing mid-compaction — retry.
+				continue
+			}
+			return err
+		}
+
+		db.cache.Set(key, val)
+		err = db.hookAndCall(key, val, fn)
+		db.cache.Pool.Put(buf)
+		return err
+	}
+	return ErrKeyNotFound
+}
+
+// hookAndCall applies OnRead and invokes fn. A hook gets a private copy so it
+// cannot mutate a cache-owned buffer in place.
+func (db *DB) hookAndCall(key, raw []byte, fn func([]byte) error) error {
+	if db.hooks != nil && db.hooks.OnRead != nil {
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		raw = cp
+	}
+	hooked, err := db.applyReadHook(key, raw)
+	if err != nil {
+		return err
+	}
+	return fn(hooked)
 }
 
 // applyReadHook runs OnRead after a successful read (cache hit or decode).
@@ -634,6 +705,56 @@ func (db *DB) Delete(key []byte) error {
 	}
 	db.index.Load().DeleteIfStale(key, tombstoneOffset)
 	db.cache.Delete(key)
+	return nil
+}
+
+// BatchDelete removes multiple keys in one batched tombstone write. Index and
+// cache entries are retired in offset order so a concurrent Set of the same
+// key always wins if it was written later.
+func (db *DB) BatchDelete(keys [][]byte) error {
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	for _, k := range keys {
+		if len(k) == 0 {
+			return ErrKeyEmpty
+		}
+		if len(k) > db.config.MaxKeySize {
+			return ErrKeyTooLarge
+		}
+	}
+
+	if wal := db.wal.Load(); wal != nil {
+		for _, k := range keys {
+			_, err := wal.WriteTombstone(context.Background(), k)
+			if err != nil && errors.Is(err, storage.ErrWALClosed) {
+				if newWal := db.wal.Load(); newWal != nil && newWal != wal {
+					_, err = newWal.WriteTombstone(context.Background(), k)
+				}
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	offsets, err := func() ([]int64, error) {
+		db.writeCommitMu.RLock()
+		defer db.writeCommitMu.RUnlock()
+		return db.writer.BatchWriteTombstones(keys)
+	}()
+	if err != nil {
+		return err
+	}
+
+	idx := db.index.Load()
+	for i := range keys {
+		idx.DeleteIfStale(keys[i], offsets[i])
+		db.cache.Delete(keys[i])
+	}
 	return nil
 }
 
@@ -762,14 +883,28 @@ func (db *DB) Compact() error {
 		return true
 	}
 
+	// Reuse one read buffer for every live value; WriteRecord copies it into
+	// the output buffer immediately, so the slice never outlives this call.
+	var copyBuf []byte
+	copyValue := func(key []byte, offset int64) ([]byte, bool) {
+		value, err := oldStorage.ReadValueAt(offset, key, copyBuf)
+		if err != nil {
+			return nil, false
+		}
+		if cap(value) > cap(copyBuf) {
+			copyBuf = value[:cap(value)]
+		}
+		return value, true
+	}
+
 	// Copy records written before the snapshot offset without holding the
 	// lock. Entries deleted during this phase are reconciled below.
 	oldIndex.Range(func(key []byte, offset int64) bool {
 		if offset >= snapshotOffset {
 			return true
 		}
-		_, value, tombstone, _, err := oldStorage.ReadRecordAt(offset)
-		if err != nil || tombstone {
+		value, ok := copyValue(key, offset)
+		if !ok {
 			return true
 		}
 		if !copyRecord(key, value) {
@@ -792,8 +927,8 @@ func (db *DB) Compact() error {
 		if offset < snapshotOffset {
 			return true
 		}
-		_, value, tombstone, _, err := oldStorage.ReadRecordAt(offset)
-		if err != nil || tombstone {
+		value, ok := copyValue(key, offset)
+		if !ok {
 			return true
 		}
 		if !copyRecord(key, value) {
@@ -895,18 +1030,56 @@ func (db *DB) CompactIfNeeded() error {
 	if logical <= 0 {
 		return nil
 	}
-	estimatedLive := int64(idx.Len()) * (logical / int64(idx.Len()))
-	fragmentation := 1 - float64(estimatedLive)/float64(logical)
+	live := estimateLiveBytes(idx, store, logical)
+	if live <= 0 {
+		return nil
+	}
+	fragmentation := 1 - float64(live)/float64(logical)
 	if fragmentation > db.config.CompactionFragmentation {
 		db.logger.Fields(
 			"fragmentation", fragmentation,
 			"threshold", db.config.CompactionFragmentation,
-			"live_bytes", estimatedLive,
+			"live_bytes", live,
 			"logical_bytes", logical,
 		).Info("compaction triggered")
 		return db.Compact()
 	}
 	return nil
+}
+
+// estimateLiveBytes samples up to 1024 live records and extrapolates their
+// total size. The index stores offsets, not record sizes, so an exact answer
+// would require reading every record; sampling keeps the periodic check cheap
+// even for millions of keys while remaining accurate enough for a threshold.
+func estimateLiveBytes(idx *Index, store *storage.File, logical int64) int64 {
+	n := idx.Len()
+	if n <= 0 || logical <= 0 {
+		return 0
+	}
+	const maxSamples = 1024
+	stride := n/maxSamples + 1
+	var sampled, live int64
+	i := 0
+	idx.RangeString(func(_ string, offset int64) bool {
+		if i%stride != 0 {
+			i++
+			return true
+		}
+		i++
+		if sz, ok := store.RecordSizeAt(offset, logical); ok {
+			sampled++
+			live += sz
+		}
+		return true
+	})
+	if sampled == 0 {
+		return 0
+	}
+	est := int64(float64(live) / float64(sampled) * float64(n))
+	if est > logical {
+		est = logical
+	}
+	return est
 }
 
 // processCompaction runs the compaction loop when no lifetime manager is provided.

@@ -2,6 +2,8 @@ package oshodi
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -661,9 +663,9 @@ func TestOpenNonExistentDirectory(t *testing.T) {
 	}
 }
 
-// TestBucketScanView verifies the zero-allocation scan returns exactly what the
+// TestBucketScanner verifies the zero-allocation scan returns exactly what the
 // copying Scan returns. Callbacks copy before retaining, as documented.
-func TestBucketScanView(t *testing.T) {
+func TestBucketScanner(t *testing.T) {
 	tmpDir := t.TempDir()
 	db, err := Open(filepath.Join(tmpDir, "scanview.db"))
 	if err != nil {
@@ -687,32 +689,165 @@ func TestBucketScanView(t *testing.T) {
 
 	got := make(map[string]string, len(want))
 	var lastKey, lastVal []byte
-	if err := b.ScanView(func(k, v []byte) bool {
+	if err := b.Scanner(func(k, v []byte) bool {
 		got[string(k)] = string(v)
 		lastKey, lastVal = k, v
 		return true
 	}); err != nil {
-		t.Fatalf("ScanView: %v", err)
+		t.Fatalf("Scanner: %v", err)
 	}
 	if len(got) != len(want) {
-		t.Fatalf("ScanView returned %d records, want %d", len(got), len(want))
+		t.Fatalf("Scanner returned %d records, want %d", len(got), len(want))
 	}
 	for k, v := range want {
 		if got[k] != v {
-			t.Fatalf("ScanView[%q] = %q, want %q", k, got[k], v)
+			t.Fatalf("Scanner[%q] = %q, want %q", k, got[k], v)
 		}
 	}
 	// Buffers are reused, so the final slices must still be readable and
 	// consistent with the last callback (no dangling memory).
 	if len(lastKey) == 0 || len(lastVal) == 0 {
-		t.Fatal("ScanView handed back empty slices")
+		t.Fatal("Scanner handed back empty slices")
 	}
 
 	// An empty bucket must scan cleanly.
-	if err := db.Bucket("empty").ScanView(func(k, v []byte) bool {
+	if err := db.Bucket("empty").Scanner(func(k, v []byte) bool {
 		t.Fatal("callback ran for empty bucket")
 		return false
 	}); err != nil {
-		t.Fatalf("empty ScanView: %v", err)
+		t.Fatalf("empty Scanner: %v", err)
+	}
+}
+
+// TestBucketGetter covers the zero-copy read path: values are delivered on
+// both the cache-miss and cache-hit paths, callback errors propagate, and a
+// missing key reports ErrKeyNotFound.
+func TestBucketGetter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "getview.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	b := db.Bucket("b")
+	if err := b.Set([]byte("alpha"), []byte("one")); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	for i := 0; i < 2; i++ { // miss, then hit
+		var got string
+		if err := b.Getter([]byte("alpha"), func(v []byte) error {
+			got = string(v)
+			return nil
+		}); err != nil {
+			t.Fatalf("Getter %d: %v", i, err)
+		}
+		if got != "one" {
+			t.Fatalf("Getter %d value = %q, want one", i, got)
+		}
+	}
+
+	if err := b.Getter([]byte("missing"), func(v []byte) error { return nil }); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("missing key err = %v, want ErrKeyNotFound", err)
+	}
+
+	want := errors.New("stop")
+	if err := b.Getter([]byte("alpha"), func(v []byte) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("callback error = %v, want %v", err, want)
+	}
+}
+
+// TestBucketScannerE covers the error-propagating reusable-buffer scan.
+func TestBucketScannerE(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "scannere.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	b := db.Bucket("b")
+	want := map[string]string{"a": "one", "b": "two", "c": "three"}
+	for k, v := range want {
+		if err := b.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+
+	got := map[string]string{}
+	if err := b.ScannerE(context.Background(), func(k, v []byte) error {
+		got[string(k)] = string(v) // copy before the buffers are reused
+		return nil
+	}); err != nil {
+		t.Fatalf("ScannerE: %v", err)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("ScannerE[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+
+	wantErr := errors.New("stop")
+	if err := b.ScannerE(context.Background(), func(k, v []byte) error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("callback error = %v, want %v", err, wantErr)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.ScannerE(ctx, func(k, v []byte) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled scan error = %v, want context.Canceled", err)
+	}
+}
+
+func TestBucketBatchDelete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batchdel.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	b := db.Bucket("b")
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+	if err := b.BatchDelete([][]byte{[]byte("a"), []byte("c"), []byte("e")}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	for _, k := range []string{"a", "c", "e"} {
+		if _, err := b.Get([]byte(k)); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("%q survived batch delete: %v", k, err)
+		}
+	}
+	for _, k := range []string{"b", "d"} {
+		if v, err := b.Get([]byte(k)); err != nil || string(v) != "v-"+k {
+			t.Fatalf("%q = %q, %v", k, v, err)
+		}
+	}
+	if err := b.BatchDelete([][]byte{[]byte("")}); !errors.Is(err, ErrKeyEmpty) {
+		t.Fatalf("empty key err = %v, want ErrKeyEmpty", err)
+	}
+	if err := b.BatchDelete(nil); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Deletions must survive a reopen.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	b = db.Bucket("b")
+	if all, err := b.GetAll(); err != nil || len(all) != 2 {
+		t.Fatalf("records after reopen = %d, %v; want 2", len(all), err)
+	}
+	for _, k := range []string{"a", "c", "e"} {
+		if _, err := b.Get([]byte(k)); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("%q resurrected after reopen: %v", k, err)
+		}
 	}
 }

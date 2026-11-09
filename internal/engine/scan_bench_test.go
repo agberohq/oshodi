@@ -84,7 +84,7 @@ func BenchmarkScanValues(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := bk.ScanView(func(k, v []byte) bool {
+				if err := bk.Scanner(func(k, v []byte) bool {
 					sink += uint64(len(k)) + uint64(v[0])
 					return true
 				}); err != nil {
@@ -106,7 +106,7 @@ func BenchmarkScanDecode(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				var doc scanBenchDoc
-				if err := bk.ScanView(func(_, v []byte) bool {
+				if err := bk.Scanner(func(_, v []byte) bool {
 					if decodeErr = json.Unmarshal(v, &doc); decodeErr != nil {
 						return false
 					}

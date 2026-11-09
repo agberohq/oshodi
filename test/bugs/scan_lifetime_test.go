@@ -9,11 +9,11 @@ import (
 	"github.com/agberohq/oshodi"
 )
 
-// Scan must hand out slices the callback can retain; ScanView must reuse its
+// Scan must hand out slices the callback can retain; Scanner must reuse its
 // buffers (callback-scoped lifetime) and stay allocation-free per record.
 // Optimising Scan by silently reusing buffers would corrupt retained values,
 // which is why the two contracts are separate APIs.
-func TestScanRetainsSlicesWhileScanViewReuses(t *testing.T) {
+func TestScanRetainsSlicesWhileScannerReuses(t *testing.T) {
 	db, err := oshodi.Open(filepath.Join(t.TempDir(), "scan.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -50,9 +50,9 @@ func TestScanRetainsSlicesWhileScanViewReuses(t *testing.T) {
 		}
 	}
 
-	// ScanView: copy inside the callback and verify the result.
+	// Scanner: copy inside the callback and verify the result.
 	seen := make(map[string]string, n)
-	if err := b.ScanView(func(k, v []byte) bool {
+	if err := b.Scanner(func(k, v []byte) bool {
 		seen[string(k)] = string(v)
 		return true
 	}); err != nil {
@@ -66,9 +66,9 @@ func TestScanRetainsSlicesWhileScanViewReuses(t *testing.T) {
 
 	// Buffers are reused, so a scan must not allocate per record.
 	allocs := testing.AllocsPerRun(20, func() {
-		_ = b.ScanView(func(k, v []byte) bool { return true })
+		_ = b.Scanner(func(k, v []byte) bool { return true })
 	})
 	if !raceEnabled && allocs > 16 {
-		t.Fatalf("ScanView allocated %.0f objects per scan of %d records", allocs, n)
+		t.Fatalf("Scanner allocated %.0f objects per scan of %d records", allocs, n)
 	}
 }

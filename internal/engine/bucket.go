@@ -68,6 +68,52 @@ func (b *Bucket) Get(key []byte) ([]byte, error) {
 	return b.db.Get(fullKey)
 }
 
+// Exists reports whether key has an index entry, without reading or
+// validating the stored value. Use Get when the value is needed.
+func (b *Bucket) Exists(key []byte) bool {
+	if b.db.closed.Load() || len(key) == 0 {
+		return false
+	}
+	fullKey := b.makeKey(key)
+	idx := b.db.index.Load()
+	if !idx.MaybeHas(fullKey) {
+		return false
+	}
+	_, ok := idx.Get(fullKey)
+	return ok
+}
+
+// BatchDelete removes multiple keys through one batched tombstone write.
+func (b *Bucket) BatchDelete(keys [][]byte) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	namespaced := make([][]byte, len(keys))
+	for i, k := range keys {
+		if len(k) == 0 {
+			return ErrKeyEmpty
+		}
+		namespaced[i] = b.makeKey(k)
+	}
+	return b.db.BatchDelete(namespaced)
+}
+
+// Getter is Get without an owned value copy: value is only valid until fn
+// returns, and must not be retained or mutated. Hooks, when configured, still
+// receive a private copy.
+func (b *Bucket) Getter(key []byte, fn func(value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	if len(key) == 0 {
+		return ErrKeyNotFound
+	}
+	return b.db.Getter(b.makeKey(key), fn)
+}
+
 // Delete removes a key
 func (b *Bucket) Delete(key []byte) error {
 	fullKey := b.makeKey(key)
@@ -92,10 +138,9 @@ func (b *Bucket) GetAll() ([]KV, error) {
 		if err != nil {
 			return true
 		}
-		result = append(result, KV{
-			Key:   append([]byte(nil), userKey...),
-			Value: append([]byte(nil), val...),
-		})
+		// fullKey and val are already freshly allocated per entry, so they
+		// can be retained without another copy.
+		result = append(result, KV{Key: userKey, Value: val})
 		return true
 	})
 	return result, nil
@@ -123,12 +168,12 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 	return nil
 }
 
-// ScanView iterates over all key-value pairs in the bucket while reusing its
+// Scanner iterates over all key-value pairs in the bucket while reusing its
 // read buffers instead of allocating per record. The key and value slices are backed by buffers that
 // are reused for the next record: both are only valid until fn returns. Copy
 // anything that must outlive the callback. Use Scan when the callback needs
 // to retain the slices.
-func (b *Bucket) ScanView(fn func(key, value []byte) bool) error {
+func (b *Bucket) Scanner(fn func(key, value []byte) bool) error {
 	if b.db.closed.Load() {
 		return ErrDBClosed
 	}
@@ -151,6 +196,51 @@ func (b *Bucket) ScanView(fn func(key, value []byte) bool) error {
 		return fn(fullKey[len(b.prefix):], val)
 	})
 	return nil
+}
+
+// ScannerE iterates over all key-value pairs while reusing its read buffers,
+// and propagates context, storage and callback errors. key and value are only
+// valid until fn returns. It is the error-propagating counterpart of Scanner,
+// intended for rebuild-style passes that process and copy each record
+// immediately.
+func (b *Bucket) ScannerE(ctx context.Context, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	idx := b.db.index.Load()
+	store := b.db.storage.Load()
+	prefix := string(b.prefix)
+	var fullKey, valBuf []byte
+	var scanErr error
+	idx.RangeString(func(k string, offset int64) bool {
+		if !strings.HasPrefix(k, prefix) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			scanErr = ctx.Err()
+			return false
+		default:
+		}
+		fullKey = append(fullKey[:0], k...)
+		val, err := store.ReadValueAt(offset, fullKey, valBuf)
+		if err != nil {
+			scanErr = err
+			return false
+		}
+		if cap(val) > cap(valBuf) {
+			valBuf = val[:cap(val)]
+		}
+		if err := fn(fullKey[len(b.prefix):], val); err != nil {
+			scanErr = err
+			return false
+		}
+		return true
+	})
+	return scanErr
 }
 
 // ScanE is the error-propagating scan: storage read errors, context
@@ -183,7 +273,7 @@ func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) er
 			scanErr = err
 			return false
 		}
-		if err := fn(append([]byte(nil), userKey...), val); err != nil {
+		if err := fn(userKey, val); err != nil {
 			scanErr = err
 			return false
 		}
