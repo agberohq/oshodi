@@ -66,8 +66,21 @@ func (r *ReqResp) Handlers() []string {
 	return r.handlers.Keys()
 }
 
-// Call invokes the named handler with timeout protection.
-// Uses pooled channels and timers to eliminate per-call allocations.
+// runHandler is a package-level goroutine body: passing the values as
+// arguments avoids the heap-allocated closure a `go func(){...}()` would
+// capture on every Call.
+func runHandler(fn HandlerFunc, payload []byte, ch chan callResult) {
+	data, err := fn(payload)
+	select {
+	case ch <- callResult{data: data, err: err}:
+	default:
+	}
+}
+
+// Call invokes the named handler with timeout protection. It runs the handler
+// in its own goroutine so a blocking handler cannot block the caller past the
+// timeout; use CallDirect for handlers known to return promptly, as it avoids
+// the goroutine and channel round trip.
 func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 	fn, ok := r.handlers.Get(name)
 	if !ok {
@@ -75,15 +88,8 @@ func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 	}
 
 	ch := resultPool.Get().(chan callResult)
-	defer resultPool.Put(ch)
 
-	go func() {
-		data, err := fn(payload)
-		select {
-		case ch <- callResult{data: data, err: err}:
-		default:
-		}
-	}()
+	go runHandler(fn, payload, ch)
 
 	// Reuse a pooled timer to avoid heap allocation.
 	timer := timerPool.Get().(*time.Timer)
@@ -100,10 +106,16 @@ func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 			}
 		}
 		timerPool.Put(timer)
+		// The handler has sent and returned; the channel is safe to reuse.
+		resultPool.Put(ch)
 		return res.data, res.err
 	case <-timer.C:
 		// The firing was consumed by this select, so the timer is drained.
 		timerPool.Put(timer)
+		// Never recycle ch here: the handler may still be running and will
+		// send its result later. Reusing it would deliver that stale result
+		// to an unrelated caller. Dropping it lets the buffered send finish
+		// and the channel be collected with the handler.
 		return nil, fmt.Errorf("call to %q timed out", name)
 	}
 }

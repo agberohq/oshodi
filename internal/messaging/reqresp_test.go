@@ -167,6 +167,7 @@ func BenchmarkReqRespCall(b *testing.B) {
 
 	payload := []byte("request")
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rr.Call(name, payload)
@@ -182,8 +183,52 @@ func BenchmarkReqRespCallDirect(b *testing.B) {
 
 	payload := []byte("request")
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rr.CallDirect(name, payload)
+	}
+}
+
+// TestCallTimeoutDoesNotDeliverStaleResult pins the pooled-channel bug: after
+// a timeout the handler goroutine may still send, and a recycled channel would
+// deliver that stale result to the next caller.
+func TestCallTimeoutDoesNotDeliverStaleResult(t *testing.T) {
+	rr := NewReqResp(50 * time.Millisecond)
+
+	var slowOnce, fastOnce sync.Once
+	releaseSlow := make(chan struct{})
+	releaseFast := make(chan struct{})
+	defer slowOnce.Do(func() { close(releaseSlow) })
+	defer fastOnce.Do(func() { close(releaseFast) })
+
+	rr.Register("slow", func([]byte) ([]byte, error) {
+		<-releaseSlow
+		return []byte("slow"), nil
+	})
+	if _, err := rr.Call("slow", nil); err == nil {
+		t.Fatal("slow call did not time out")
+	}
+
+	fastStarted := make(chan struct{})
+	rr.Register("fast", func([]byte) ([]byte, error) {
+		close(fastStarted)
+		<-releaseFast
+		return []byte("fast"), nil
+	})
+
+	go func() {
+		<-fastStarted
+		slowOnce.Do(func() { close(releaseSlow) })
+		time.Sleep(10 * time.Millisecond)
+		fastOnce.Do(func() { close(releaseFast) })
+	}()
+
+	got, err := rr.Call("fast", nil)
+	if err != nil {
+		t.Fatalf("fast call: %v", err)
+	}
+	if string(got) != "fast" {
+		t.Fatalf("fast call got %q; a timed-out call's result was delivered", got)
 	}
 }
