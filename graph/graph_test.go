@@ -198,3 +198,95 @@ func TestGraphLifecycle(t *testing.T) {
 	}
 	_ = os.RemoveAll(t.TempDir())
 }
+
+func TestAddVerticesBulk(t *testing.T) {
+	dir := t.TempDir()
+	db, err := oshodi.Open(dir + "/bulk.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	g, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+
+	specs := []VertexSpec{
+		{ID: "a", Label: "song", Props: []byte(`{"n":1}`)},
+		{ID: "b", Label: "song", Props: []byte(`{"n":2}`)},
+		{ID: "c", Label: "artist", Props: nil},
+	}
+	if err := g.AddVertices(specs); err != nil {
+		t.Fatalf("AddVertices: %v", err)
+	}
+	for _, sp := range specs {
+		el, err := g.Vertex(sp.ID)
+		if err != nil {
+			t.Fatalf("Vertex(%q): %v", sp.ID, err)
+		}
+		if el.Label != sp.Label {
+			t.Fatalf("Vertex(%q) label = %q, want %q", sp.ID, el.Label, sp.Label)
+		}
+		if string(el.Props) != string(sp.Props) {
+			t.Fatalf("Vertex(%q) props = %q, want %q", sp.ID, el.Props, sp.Props)
+		}
+	}
+
+	// Label is immutable, and validation happens before any write.
+	err = g.AddVertices([]VertexSpec{
+		{ID: "a", Label: "album"},
+		{ID: "d", Label: "song"},
+	})
+	if !errors.Is(err, ErrLabelConflict) {
+		t.Fatalf("label conflict err = %v, want ErrLabelConflict", err)
+	}
+	if g.vertices.Exists([]byte("d")) {
+		t.Fatal("batch wrote a vertex after validation failed")
+	}
+
+	if err := g.AddVertices([]VertexSpec{{ID: "x"}, {ID: "x"}}); !errors.Is(err, ErrDuplicateIdentity) {
+		t.Fatalf("duplicate err = %v, want ErrDuplicateIdentity", err)
+	}
+
+	// Properties update through the same path.
+	if err := g.AddVertices([]VertexSpec{{ID: "a", Label: "song", Props: []byte(`{"n":9}`)}}); err != nil {
+		t.Fatalf("update props: %v", err)
+	}
+	el, err := g.Vertex("a")
+	if err != nil || string(el.Props) != `{"n":9}` {
+		t.Fatalf("updated props = %q err=%v", el.Props, err)
+	}
+}
+
+func TestRemoveVertexSelfLoop(t *testing.T) {
+	g, err := Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+
+	if err := g.AddVertex("v", "song", nil); err != nil {
+		t.Fatal(err)
+	}
+	id, err := g.AddEdge("v", "v", "self", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.RemoveVertex("v"); err != nil {
+		t.Fatalf("remove self-loop vertex: %v", err)
+	}
+	if _, err := g.Edge(id); err != ErrEdgeNotFound {
+		t.Fatalf("self-loop edge survived: %v", err)
+	}
+	ids, err := g.E().IDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("edge stream after cascade = %v, want empty", ids)
+	}
+	if _, err := g.Vertex("v"); err != ErrVertexNotFound {
+		t.Fatalf("vertex survived: %v", err)
+	}
+}

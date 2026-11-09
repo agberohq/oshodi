@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"errors"
 	"fmt"
 )
 
@@ -11,30 +10,32 @@ import (
 // defensively dropped.
 func (g *Graph) rebuild() error {
 	g.adj = newAdjacency()
+	// Resolve the vertex set once. Checking endpoints with a point lookup per
+	// edge would read and materialise every endpoint record twice.
+	ids, err := g.allVertexIDs()
+	if err != nil {
+		return fmt.Errorf("graph: rebuild vertices: %w", err)
+	}
+	vertices := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		vertices[id] = struct{}{}
+	}
 	var dangling []string
 
-	err := g.edges.ScanE(nil, func(key []byte, value []byte) error {
+	err = g.edges.ScannerE(nil, func(key []byte, value []byte) error {
 		src, dst, label, _, derr := decodeEdgeRecord(value)
 		if derr != nil {
 			g.corrupt.Add(1)
 			return nil
 		}
 		id := string(key)
-		// Endpoints checked inside the scan callback: the rebuild streams
-		// and never buffers the whole edge set.
-		if err := g.mustExist(src); err != nil {
-			if errors.Is(err, ErrVertexNotFound) {
-				dangling = append(dangling, id)
-				return nil
-			}
-			return err
+		if _, ok := vertices[src]; !ok {
+			dangling = append(dangling, id)
+			return nil
 		}
-		if err := g.mustExist(dst); err != nil {
-			if errors.Is(err, ErrVertexNotFound) {
-				dangling = append(dangling, id)
-				return nil
-			}
-			return err
+		if _, ok := vertices[dst]; !ok {
+			dangling = append(dangling, id)
+			return nil
 		}
 		g.adj.add(src, dst, label, id)
 		return nil
@@ -55,7 +56,7 @@ func (g *Graph) rebuild() error {
 // allVertexIDs enumerates every vertex id (isolated vertices included).
 func (g *Graph) allVertexIDs() ([]string, error) {
 	var ids []string
-	err := g.vertices.ScanE(nil, func(key []byte, _ []byte) error {
+	err := g.vertices.ScannerE(nil, func(key []byte, _ []byte) error {
 		ids = append(ids, string(key))
 		return nil
 	})
@@ -81,8 +82,7 @@ func (g *Graph) Stats() map[string]int {
 // graph-side helpers used by traversal (call with coord held)
 
 func (g *Graph) hasVertexLocked(id string) bool {
-	_, err := g.vertices.Get([]byte(id))
-	return err == nil
+	return g.vertices.Exists([]byte(id))
 }
 
 func (g *Graph) vertexLabelLocked(id string) (string, error) {
@@ -99,7 +99,7 @@ func (g *Graph) vertexLabelLocked(id string) (string, error) {
 // errors — they are not adjacency data.
 func (g *Graph) allEdgeElements() ([]Element, error) {
 	var out []Element
-	err := g.edges.ScanE(nil, func(key []byte, value []byte) error {
+	err := g.edges.ScannerE(nil, func(key []byte, value []byte) error {
 		src, dst, label, props, derr := decodeEdgeRecord(value)
 		if derr != nil {
 			g.corrupt.Add(1)

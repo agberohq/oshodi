@@ -57,17 +57,30 @@ func (g *Graph) SetVertex(id string, props []byte) error {
 // vertex).
 func (g *Graph) RemoveVertex(id string) error {
 	return g.runMutation(func() error {
-		if _, err := g.vertices.Get([]byte(id)); err == oshodi.ErrKeyNotFound {
+		if !g.vertices.Exists([]byte(id)) {
 			return ErrVertexNotFound
-		} else if err != nil {
-			return err
 		}
 		edges := g.collectIncidentLocked(id)
-		for _, e := range edges {
-			if err := g.edges.Delete([]byte(e.id)); err != nil {
+		if len(edges) > 0 {
+			// A self-loop is incident twice; delete its tombstone once.
+			seen := make(map[string]struct{}, len(edges))
+			ids := make([][]byte, 0, len(edges))
+			for _, e := range edges {
+				if _, ok := seen[e.id]; ok {
+					continue
+				}
+				seen[e.id] = struct{}{}
+				ids = append(ids, []byte(e.id))
+			}
+			if err := g.edges.BatchDelete(ids); err != nil {
+				// A partially applied tombstone batch leaves adjacency
+				// disagreeing with storage; fail closed.
+				g.markDirty()
 				return err
 			}
-			g.adj.remove(e.src, e.dst, e.label, e.id)
+			for _, e := range edges {
+				g.adj.remove(e.src, e.dst, e.label, e.id)
+			}
 		}
 		return g.vertices.Delete([]byte(id))
 	})
@@ -182,10 +195,8 @@ func (g *Graph) RemoveEdge(id string) error {
 // helpers (call with coord held)
 
 func (g *Graph) mustExist(id string) error {
-	if _, err := g.vertices.Get([]byte(id)); err == oshodi.ErrKeyNotFound {
+	if !g.vertices.Exists([]byte(id)) {
 		return fmt.Errorf("vertex %q: %w", id, ErrVertexNotFound)
-	} else if err != nil {
-		return err
 	}
 	return nil
 }
@@ -281,11 +292,8 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 					continue
 				}
 				seenVertex[end] = struct{}{}
-				if _, err := g.vertices.Get([]byte(end)); err != nil {
-					if err == oshodi.ErrKeyNotFound {
-						return fmt.Errorf("vertex %q: %w", end, ErrVertexNotFound)
-					}
-					return err
+				if !g.vertices.Exists([]byte(end)) {
+					return fmt.Errorf("vertex %q: %w", end, ErrVertexNotFound)
 				}
 			}
 			ids[i] = sp.ID
@@ -295,11 +303,62 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 			})
 		}
 		if err := g.edges.BatchSet(entries); err != nil {
+			// The batch may be partially applied; adjacency can no longer be
+			// trusted. Traversals must fail closed until the graph reopens.
+			g.markDirty()
 			return err
 		}
 		for i := range specs {
 			g.adj.add(specs[i].Src, specs[i].Dst, specs[i].Label, ids[i])
 		}
 		return nil
+	})
+}
+
+// VertexSpec is one vertex for AddVertices.
+type VertexSpec struct {
+	ID    string
+	Label string
+	Props []byte
+}
+
+// AddVertices creates or updates vertices in bulk. Semantics match AddVertex
+// per entry (labels are immutable), but all records are validated first and
+// written through one batched write, which is much cheaper than one Set per
+// vertex when importing a graph.
+func (g *Graph) AddVertices(specs []VertexSpec) error {
+	if len(specs) == 0 {
+		return nil
+	}
+	return g.runMutation(func() error {
+		seen := make(map[string]struct{}, len(specs))
+		entries := make([]oshodi.KV, 0, len(specs))
+		for _, sp := range specs {
+			if sp.ID == "" {
+				return ErrInvalidIdentity
+			}
+			if _, dup := seen[sp.ID]; dup {
+				return fmt.Errorf("vertex %q duplicated within batch: %w", sp.ID, ErrDuplicateIdentity)
+			}
+			seen[sp.ID] = struct{}{}
+
+			raw, err := g.vertices.Get([]byte(sp.ID))
+			switch {
+			case err == oshodi.ErrKeyNotFound:
+				entries = append(entries, oshodi.KV{Key: []byte(sp.ID), Value: encodeVertexRecord(sp.Label, sp.Props)})
+			case err != nil:
+				return err
+			default:
+				oldLabel, _, derr := decodeVertexRecord(raw)
+				if derr != nil {
+					return derr
+				}
+				if oldLabel != sp.Label {
+					return fmt.Errorf("vertex %q has label %q: %w", sp.ID, oldLabel, ErrLabelConflict)
+				}
+				entries = append(entries, oshodi.KV{Key: []byte(sp.ID), Value: encodeVertexRecord(oldLabel, sp.Props)})
+			}
+		}
+		return g.vertices.BatchSet(entries)
 	})
 }

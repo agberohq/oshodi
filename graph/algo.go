@@ -21,31 +21,16 @@ func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, e
 		if err != nil {
 			return err
 		}
-		set := make(map[string]struct{}, len(ids))
-		for _, id := range ids {
-			set[id] = struct{}{}
-		}
 		n := float64(len(ids))
 		if n == 0 {
 			result = map[string]float64{}
 			return nil
 		}
 
-		degree := make(map[string]float64, len(ids))
-		var dangling float64 = 0
-		for id := range set {
-			_, ok := g.adj.out[id]
-			if !ok {
-				dangling++
-				continue
-			}
-			for _, targets := range g.adj.out[id] {
-				for range targets {
-					degree[id]++
-				}
-			}
-			if degree[id] == 0 {
-				dangling++
+		degree := make(map[string]int, len(g.adj.out))
+		for id, lm := range g.adj.out {
+			for _, targets := range lm {
+				degree[id] += len(targets)
 			}
 		}
 
@@ -53,30 +38,30 @@ func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, e
 		for _, id := range ids {
 			rank[id] = 1 / n
 		}
+		next := make(map[string]float64, len(ids))
 
 		for it := 0; it < iterations; it++ {
-			next := make(map[string]float64, len(ids))
+			clear(next)
 			danglingSum := 0.0
-			for id := range set {
+			for _, id := range ids {
+				d := degree[id]
 				r := rank[id]
-				if degree[id] == 0 {
+				if d == 0 {
 					danglingSum += r
 					continue
 				}
-				share := damping * r / degree[id]
+				share := damping * r / float64(d)
 				for _, targets := range g.adj.out[id] {
 					for dst := range targets {
 						next[dst] += share
 					}
 				}
 			}
+			base := (1-damping)/n + damping*danglingSum/n
 			for _, id := range ids {
-				base := (1-damping)/n + damping*danglingSum/n
-				if _, ok := set[id]; ok {
-					next[id] += base
-				}
+				next[id] += base
 			}
-			rank = next
+			rank, next = next, rank
 		}
 
 		result = rank
