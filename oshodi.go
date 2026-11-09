@@ -242,10 +242,10 @@ func (db *DB) Reduce(ctx context.Context, results []MapResult, fn ReduceFunc) (m
 // This is the primary API for data processing in Oshodi.
 //
 // The pipeline works as follows:
-// 1. Scan: Enumerate all keys from the index and read values from storage.
-// 2. Map: Transform each record into an intermediate key-value pair.
-// 3. Combiner (optional): Worker-local aggregation to reduce intermediate data.
-// 4. Reduce: Combine all intermediate results into final output.
+// Scan: Enumerate all keys from the index and read values from storage.
+// Map: Transform each record into an intermediate key-value pair.
+// Combiner (optional): Worker-local aggregation to reduce intermediate data.
+// Reduce: Combine all intermediate results into final output.
 //
 // Consistency: MapReduce does NOT provide snapshot isolation. It observes the
 // current state of the database as it iterates. For analytics workloads this
@@ -393,6 +393,18 @@ func (b *Bucket) GetAll() ([]KV, error) {
 // Scan iterates over all key-value pairs without copying
 func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 	return b.inner.Scan(fn)
+}
+
+// ScanView iterates over all key-value pairs while reusing its read buffers
+// instead of allocating a copy per record.
+// key and value are backed by buffers reused for the next record, so both are
+// only valid until fn returns. Copy anything that must outlive the callback;
+// use Scan when the callback needs to retain the slices.
+func (b *Bucket) ScanView(fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanView(fn)
 }
 
 // ScanE is the error-propagating scan: storage read errors, context

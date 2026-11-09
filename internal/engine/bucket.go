@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"strings"
 )
 
 // bucketKeySeparator joins the bucket name and the user key/channel/handler
@@ -87,8 +88,7 @@ func (b *Bucket) GetAll() ([]KV, error) {
 		}
 		store := b.db.storage.Load()
 
-		// Fixed: pass nil as 3rd param for dynamic allocation
-		val, err := store.ReadAt(offset, fullKey, nil)
+		val, err := store.ReadValueAt(offset, fullKey, nil)
 		if err != nil {
 			return true
 		}
@@ -114,12 +114,41 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 		}
 		store := b.db.storage.Load()
 
-		// Fixed: pass nil as 3rd param for dynamic allocation
-		val, err := store.ReadAt(offset, fullKey, nil)
+		val, err := store.ReadValueAt(offset, fullKey, nil)
 		if err != nil {
 			return true
 		}
 		return fn(userKey, val)
+	})
+	return nil
+}
+
+// ScanView iterates over all key-value pairs in the bucket while reusing its
+// read buffers instead of allocating per record. The key and value slices are backed by buffers that
+// are reused for the next record: both are only valid until fn returns. Copy
+// anything that must outlive the callback. Use Scan when the callback needs
+// to retain the slices.
+func (b *Bucket) ScanView(fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	idx := b.db.index.Load()
+	store := b.db.storage.Load()
+	prefix := string(b.prefix)
+	var fullKey, valBuf []byte
+	idx.RangeString(func(k string, offset int64) bool {
+		if !strings.HasPrefix(k, prefix) {
+			return true
+		}
+		fullKey = append(fullKey[:0], k...)
+		val, err := store.ReadValueAt(offset, fullKey, valBuf)
+		if err != nil {
+			return true
+		}
+		if cap(val) > cap(valBuf) {
+			valBuf = val[:cap(val)]
+		}
+		return fn(fullKey[len(b.prefix):], val)
 	})
 	return nil
 }
@@ -149,7 +178,7 @@ func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) er
 			return false
 		default:
 		}
-		val, err := store.ReadAt(offset, fullKey, nil)
+		val, err := store.ReadValueAt(offset, fullKey, nil)
 		if err != nil {
 			scanErr = err
 			return false

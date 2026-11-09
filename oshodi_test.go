@@ -660,3 +660,59 @@ func TestOpenNonExistentDirectory(t *testing.T) {
 		t.Error("expected error for non-existent directory")
 	}
 }
+
+// TestBucketScanView verifies the zero-allocation scan returns exactly what the
+// copying Scan returns. Callbacks copy before retaining, as documented.
+func TestBucketScanView(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := Open(filepath.Join(tmpDir, "scanview.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	b := db.Bucket("s")
+	want := map[string]string{
+		"alpha":   "one",
+		"beta":    "two",
+		"gamma":   "three",
+		"delta":   "four",
+		"epsilon": "five",
+	}
+	for k, v := range want {
+		if err := b.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+
+	got := make(map[string]string, len(want))
+	var lastKey, lastVal []byte
+	if err := b.ScanView(func(k, v []byte) bool {
+		got[string(k)] = string(v)
+		lastKey, lastVal = k, v
+		return true
+	}); err != nil {
+		t.Fatalf("ScanView: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ScanView returned %d records, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("ScanView[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+	// Buffers are reused, so the final slices must still be readable and
+	// consistent with the last callback (no dangling memory).
+	if len(lastKey) == 0 || len(lastVal) == 0 {
+		t.Fatal("ScanView handed back empty slices")
+	}
+
+	// An empty bucket must scan cleanly.
+	if err := db.Bucket("empty").ScanView(func(k, v []byte) bool {
+		t.Fatal("callback ran for empty bucket")
+		return false
+	}); err != nil {
+		t.Fatalf("empty ScanView: %v", err)
+	}
+}

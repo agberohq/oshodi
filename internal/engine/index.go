@@ -115,3 +115,10 @@ func (idx *Index) Scan(fn func(key []byte, offset int64) error) error {
 	})
 	return result
 }
+
+// RangeString iterates like Range but passes the map's own string key. It
+// avoids materialising a []byte copy per entry, which is the dominant cost of
+// a large scan. The string is immutable and safe to retain.
+func (idx *Index) RangeString(fn func(key string, offset int64) bool) {
+	idx.shards.Range(fn)
+}
