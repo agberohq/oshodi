@@ -123,10 +123,10 @@ func (db *DB) Reduce(ctx context.Context, results []MapResult, fn ReduceFunc) (m
 // This is the primary API for data processing in Oshodi.
 //
 // The pipeline works as follows:
-// 1. Scan: Enumerate all keys from the index and read values from storage.
-// 2. Map: Transform each record into an intermediate key-value pair.
-// 3. Combiner (optional): Worker-local aggregation to reduce intermediate data.
-// 4. Reduce: Combine all intermediate results into final output.
+// Scan: Enumerate all keys from the index and read values from storage.
+// Map: Transform each record into an intermediate key-value pair.
+// Combiner (optional): Worker-local aggregation to reduce intermediate data.
+// Reduce: Combine all intermediate results into final output.
 //
 // Consistency: MapReduce does NOT provide snapshot isolation. It observes the
 // current state of the database as it iterates. For analytics workloads this

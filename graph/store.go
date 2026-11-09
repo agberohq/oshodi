@@ -179,7 +179,7 @@ func (g *Graph) RemoveEdge(id string) error {
 	})
 }
 
-// --- helpers (call with coord held) ---
+// helpers (call with coord held)
 
 func (g *Graph) mustExist(id string) error {
 	if _, err := g.vertices.Get([]byte(id)); err == oshodi.ErrKeyNotFound {

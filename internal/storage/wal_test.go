@@ -1,4 +1,3 @@
-// wal_test.go
 package storage
 
 import (

@@ -78,7 +78,7 @@ func (g *Graph) Stats() map[string]int {
 	}
 }
 
-// --- graph-side helpers used by traversal (call with coord held) ---
+// graph-side helpers used by traversal (call with coord held)
 
 func (g *Graph) hasVertexLocked(id string) bool {
 	_, err := g.vertices.Get([]byte(id))

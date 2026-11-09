@@ -21,7 +21,7 @@ import (
 	"github.com/agberohq/oshodi/internal/storage"
 )
 
-// ---- value domain -------------------------------------------------------
+// value domain
 
 func makeValue(writer int, seq uint64, fill int) []byte {
 	v := make([]byte, 12+fill)
@@ -47,7 +47,7 @@ func parseValue(v []byte) (writer uint32, seq uint64, ok bool) {
 	return writer, seq, true
 }
 
-// ---- model --------------------------------------------------------------
+// model
 
 type jmodel struct {
 	mu   sync.Mutex
@@ -106,7 +106,7 @@ func assertJState(t *testing.T, db *DB, want map[string][]byte) {
 	}
 }
 
-// ---- 1. mixed-operation model check -------------------------------------
+// mixed-operation model check
 
 func TestJepsenMixedOps(t *testing.T) {
 	dir := t.TempDir()
@@ -187,7 +187,7 @@ func TestJepsenMixedOps(t *testing.T) {
 	assertJState(t, db, m.snapshot())
 }
 
-// ---- 2. chaos under compaction ------------------------------------------
+// chaos under compaction
 
 func TestJepsenCompactChaos(t *testing.T) {
 	dir := t.TempDir()
@@ -301,7 +301,7 @@ func TestJepsenCompactChaos(t *testing.T) {
 	assertJState(t, db, m.snapshot())
 }
 
-// ---- 3. main-file truncation + bit-rot recovery ---------------------------
+// main-file truncation + bit-rot recovery
 
 // jepsenPrefix walks record boundaries of a closed database file and
 // returns the derived state after each record, plus per-record offsets.
@@ -434,7 +434,7 @@ func TestJepsenMainFileRecovery(t *testing.T) {
 	}
 }
 
-// ---- 5. coalescing group-commit ordering -----------------------------------
+// coalescing group-commit ordering
 
 func TestJepsenCoalescedGroupCommit(t *testing.T) {
 	dir := t.TempDir()
@@ -508,7 +508,7 @@ func TestJepsenCoalescedGroupCommit(t *testing.T) {
 	assertJState(t, db, m.snapshot())
 }
 
-// ---- 6. single-process guard ------------------------------------------------
+// single-process guard
 
 func TestJepsenProcessLock(t *testing.T) {
 	dir := t.TempDir()
@@ -527,7 +527,7 @@ func TestJepsenProcessLock(t *testing.T) {
 
 var dbgTesting = true
 
-// ---- shared helpers ---------------------------------------------------------
+// shared helpers
 
 func readFileBytes(t *testing.T, path string) []byte {
 	t.Helper()

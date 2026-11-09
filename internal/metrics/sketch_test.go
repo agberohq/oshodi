@@ -1,4 +1,3 @@
-// internal/metrics/sketch_test.go
 package metrics
 
 import (

@@ -86,7 +86,7 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 	compressed := byte(0)
 	comp := sw.store.Load().Compressor()
 
-	// 1. Handle Compression (CPU bound, parallelized by shards)
+	// Handle Compression (CPU bound, parallelized by shards)
 	if comp != nil && valLen >= comp.Threshold() {
 		if enc, err := comp.Encode(value); err == nil {
 			value = enc
@@ -105,14 +105,14 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 		flag = storage.RecordFlagEmptyValue
 	}
 
-	// 2. Expand buffer if the record is larger than 1KB
+	// Expand buffer if the record is larger than 1KB
 	if cap(buf) < totalSize {
 		buf = make([]byte, totalSize)
 	} else {
 		buf = buf[:totalSize]
 	}
 
-	// 3. Binary Formatting
+	// Binary Formatting
 	pos := 0
 	binary.BigEndian.PutUint32(buf[pos:], uint32(keyLen))
 	pos += 4
@@ -125,10 +125,10 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 	pos += copy(buf[pos:], value)
 	binary.BigEndian.PutUint32(buf[pos:], storage.RecordChecksum(buf[:payloadSize]))
 
-	// 4. Lock-free write via Offset Reservation Pattern
+	// Lock-free write via Offset Reservation Pattern
 	offset, err := sw.store.Load().WriteAtomic(buf)
 
-	// 5. Zero-allocation recycle
+	// Zero-allocation recycle
 	*bufPtr = buf[:0]
 	shard.bufferPool.Put(bufPtr)
 

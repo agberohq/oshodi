@@ -178,7 +178,6 @@ func TestPubSubCount(t *testing.T) {
 	}
 }
 
-// internal/messaging/pubsub_test.go - Fix the IDs test
 func TestPubSubIDs(t *testing.T) {
 	pool := jack.NewPool(10)
 	ps := NewPubSub(pool, nil, nil, false)

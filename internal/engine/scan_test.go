@@ -30,7 +30,7 @@ func populateTestDB(t *testing.T, db *DB, count int) {
 	}
 }
 
-// --- Scan Tests ---
+// Scan Tests
 
 func TestScan_Sequential(t *testing.T) {
 	db, cleanup := newTestDB(t)
@@ -189,7 +189,7 @@ func TestScan_Parallel_ContextCancellation(t *testing.T) {
 	}
 }
 
-// --- Map Tests ---
+// Map Tests
 
 func TestMap_Basic(t *testing.T) {
 	db, cleanup := newTestDB(t)
@@ -247,7 +247,7 @@ func TestMap_Filter(t *testing.T) {
 	}
 }
 
-// --- Reduce Tests ---
+// Reduce Tests
 
 func TestReduce_Sum(t *testing.T) {
 	db, cleanup := newTestDB(t)
@@ -281,7 +281,7 @@ func TestReduce_Sum(t *testing.T) {
 	}
 }
 
-// --- MapReduce Tests ---
+// MapReduce Tests
 
 func TestMapReduce_CountByCategory(t *testing.T) {
 	db, cleanup := newTestDB(t)
@@ -537,7 +537,7 @@ func TestMapReduce_CombinerError(t *testing.T) {
 	}
 }
 
-// --- Integration: Map + Reduce separately ---
+// Integration: Map + Reduce separately
 
 func TestMapThenReduce(t *testing.T) {
 	db, cleanup := newTestDB(t)
@@ -576,7 +576,7 @@ func TestMapThenReduce(t *testing.T) {
 	}
 }
 
-// --- Benchmarks ---
+// Benchmarks
 
 func populateBenchDB(b *testing.B, db *DB, count int) {
 	b.Helper()

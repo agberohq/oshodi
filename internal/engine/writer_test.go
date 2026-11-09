@@ -1,5 +1,3 @@
-// internal/engine/writer_test.go
-// engine/writer_test.go
 package engine
 
 import (

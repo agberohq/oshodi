@@ -403,7 +403,7 @@ func (t *Traversal) OrderByID() *Traversal {
 	return t
 }
 
-// --- terminals ---
+// terminals
 
 // ToList materializes the stream with properties loaded.
 func (t *Traversal) ToList() ([]Element, error) {
@@ -490,7 +490,7 @@ func (t *Traversal) Iterate(fn func(Element) error) error {
 	return nil
 }
 
-// --- internals ---
+// internals
 
 // step runs a stage body under the graph's shared read lock. Stages execute
 // immediately: the set for each stage is materialized as the chain is
@@ -546,7 +546,7 @@ func (t *Traversal) elementProps(el Element) ([]byte, bool, error) {
 	}
 }
 
-// --- traversal internals ---
+// traversal internals
 
 type direction uint8
 
