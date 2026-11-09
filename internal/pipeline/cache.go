@@ -66,10 +66,36 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Copy from pool to avoid exposing internal slice.
-	buf := c.Pool.Get()
-	buf = append(buf[:0], val...)
-	return buf, true
+	// Copy to avoid exposing the internal slice. The caller owns this copy,
+	// so it cannot come from a pool: nothing would return it. Sizing it to
+	// the value also avoids handing out a full 1 KiB pool buffer per hit.
+	out := make([]byte, len(val))
+	copy(out, val)
+	return out, true
+}
+
+// View retrieves a cached value and passes it to fn without copying. The
+// slice is the cache's own immutable buffer; fn must not retain or mutate it.
+// fn runs after the shard lock is released, so it may call back into the cache
+// or the database. ok reports whether the key was present.
+func (c *Cache) View(key []byte, fn func(value []byte) error) (ok bool, err error) {
+	h := xxh3.Hash(key)
+
+	var val []byte
+	var hit bool
+	c.data.Update(h, func(entry cacheEntry, exists bool) cacheEntry {
+		if !exists || !bytes.Equal(entry.key, key) {
+			return entry
+		}
+		entry.access = c.access.Add(1)
+		val = entry.val
+		hit = true
+		return entry
+	})
+	if !hit {
+		return false, nil
+	}
+	return true, fn(val)
 }
 
 // Set stores a value in the cache.

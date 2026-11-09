@@ -153,3 +153,23 @@ func BenchmarkCacheGet(b *testing.B) {
 		cache.Get(key)
 	}
 }
+
+// TestCacheGetSizesCopyToValue pins the fix for cache hits handing out a
+// 1 KiB pool buffer that the caller can never return.
+func TestCacheGetSizesCopyToValue(t *testing.T) {
+	cache := NewCache(100)
+	key := []byte("k")
+	value := bytes.Repeat([]byte("v"), 64)
+	cache.Set(key, value)
+
+	got, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("cache miss")
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatal("cached value corrupted")
+	}
+	if cap(got) > 128 {
+		t.Fatalf("cache hit copy has cap %d for a 64-byte value; pool-sized buffer leaked", cap(got))
+	}
+}
