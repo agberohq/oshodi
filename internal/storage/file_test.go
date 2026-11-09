@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -466,5 +467,137 @@ func TestReadAfterGrowthRefreshesMmap(t *testing.T) {
 	}
 	if f.mappedSize.Load() < f.LogicalSize() {
 		t.Fatalf("mapping not refreshed: mapped=%d logical=%d", f.mappedSize.Load(), f.LogicalSize())
+	}
+}
+
+// TestReadKeyAt pins the index-rebuild path: keys and tombstone state are
+// returned, the value is not materialized, and the CRC still catches damage.
+func TestReadKeyAt(t *testing.T) {
+	cfg := DefaultFileConfig(filepath.Join(t.TempDir(), "keyat.db"))
+	f, err := NewFile(cfg)
+	if err != nil {
+		t.Fatalf("new file: %v", err)
+	}
+	defer f.Close()
+
+	key := []byte("songs\x00key")
+	value := bytes.Repeat([]byte("v"), 128<<10) // spans multiple stream chunks
+	off, err := f.WriteRecord(key, value)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	gotKey, tombstone, n, err := f.ReadKeyAt(off)
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+	if !bytes.Equal(gotKey, key) || tombstone {
+		t.Fatalf("key=%q tombstone=%v", gotKey, tombstone)
+	}
+	if want := int64(4 + len(key) + 4 + 1 + len(value) + 4); n != want {
+		t.Fatalf("record size = %d, want %d", n, want)
+	}
+
+	// Damage the value: the streamed CRC must still reject the record even
+	// though the value was never materialized.
+	if _, err := f.file.WriteAt([]byte{0xFF}, off+n-8); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if _, _, _, err := f.ReadKeyAt(off); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt value: err = %v, want ErrCorrupt", err)
+	}
+
+	// Empty value is a live record, not a tombstone.
+	emptyOff, err := f.WriteRecord([]byte("songs\x00empty"), nil)
+	if err != nil {
+		t.Fatalf("write empty: %v", err)
+	}
+	_, tombstone, emptyN, err := f.ReadKeyAt(emptyOff)
+	if err != nil || tombstone {
+		t.Fatalf("empty value: tombstone=%v err=%v", tombstone, err)
+	}
+
+	// Tombstone flag survives the key-only read.
+	if err := f.WriteTombstone([]byte("songs\x00gone")); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+	tombOff := emptyOff + emptyN
+	gotKey, tombstone, _, err = f.ReadKeyAt(tombOff)
+	if err != nil || !tombstone || string(gotKey) != "songs\x00gone" {
+		t.Fatalf("tombstone read: key=%q tombstone=%v err=%v", gotKey, tombstone, err)
+	}
+}
+
+// TestGrowthIsAmortized pins the growth policy: appending thousands of small
+// records must extend the file only a handful of times. The previous policy
+// reserved 5x the record size on every grow, which issued an ftruncate every
+// few writes once the initial preallocation was exhausted.
+func TestGrowthIsAmortized(t *testing.T) {
+	cfg := DefaultFileConfig(filepath.Join(t.TempDir(), "growth.db"))
+	cfg.InitialSize = 1024
+	f, err := NewFile(cfg)
+	if err != nil {
+		t.Fatalf("new file: %v", err)
+	}
+	defer f.Close()
+
+	key := []byte("k")
+	value := bytes.Repeat([]byte("v"), 100)
+	last := f.Size()
+	grows := 0
+	for i := 0; i < 2000; i++ {
+		if _, err := f.WriteRecord(key, value); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if sz := f.Size(); sz != last {
+			grows++
+			last = sz
+		}
+	}
+	if grows > 10 {
+		t.Fatalf("file grew %d times for 2000 appends; want amortized growth", grows)
+	}
+	if f.LogicalSize() <= f.Size()/2 {
+		t.Fatalf("file did not grow enough: logical=%d allocated=%d", f.LogicalSize(), f.Size())
+	}
+}
+
+// TestNextNonZero checks the word-at-a-time scan at every byte alignment.
+func TestNextNonZero(t *testing.T) {
+	cfg := DefaultFileConfig(filepath.Join(t.TempDir(), "nz.db"))
+	cfg.InitialSize = 128 << 10
+	f, err := NewFile(cfg)
+	if err != nil {
+		t.Fatalf("new file: %v", err)
+	}
+	defer f.Close()
+
+	positions := []int64{0, 1, 7, 8, 9, 63, 64, 127, 1000, 65535, 65536, 70000}
+	data := make([]byte, 128<<10)
+	for _, p := range positions {
+		data[p] = 0xAA
+	}
+	if _, err := f.file.WriteAt(data, 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	limit := int64(len(data))
+	got, ok := f.nextNonZero(0, limit)
+	if !ok || got != positions[0] {
+		t.Fatalf("first non-zero = %d ok=%v, want %d", got, ok, positions[0])
+	}
+	for i, p := range positions {
+		got, ok := f.nextNonZero(p, limit)
+		if !ok || got != p {
+			t.Fatalf("from %d: got %d ok=%v", p, got, ok)
+		}
+		if i+1 < len(positions) {
+			got, ok := f.nextNonZero(p+1, limit)
+			if !ok || got != positions[i+1] {
+				t.Fatalf("after %d: got %d ok=%v, want %d", p, got, ok, positions[i+1])
+			}
+		}
+	}
+	if _, ok := f.nextNonZero(0, 0); ok {
+		t.Fatal("zero-length range reported a non-zero byte")
 	}
 }

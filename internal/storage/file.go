@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sync"
@@ -28,6 +29,15 @@ var (
 var metaBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
+// valueScanPool provides scratch space for verifying a record's CRC without
+// materialising its value (index rebuild).
+var valueScanPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64<<10)
 		return &b
 	},
 }
@@ -170,7 +180,7 @@ func (f *File) remapLoop() {
 	}
 }
 
-func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verify []byte) (key, value []byte, tombstone bool, n int64, err error) {
+func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verify []byte, skipValue bool) (key, value []byte, tombstone bool, n int64, err error) {
 	// The key length is kept in front of the key in one pooled buffer so the
 	// CRC prefix [keyLen | key | valLen | flag] stays contiguous. Keeping it
 	// contiguous avoids the per-read heap allocation that small local arrays
@@ -272,6 +282,43 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 		}
 	}
 
+	if skipValue {
+		// The index rebuild needs only the key, but must still prove the
+		// record is intact: stream the value through the CRC instead of
+		// materialising it.
+		remaining := int64(valLen)
+		pos := offset + prefixLen
+		bufPtr := valueScanPool.Get().(*[]byte)
+		buf := *bufPtr
+		for remaining > 0 {
+			chunk := int64(len(buf))
+			if remaining < chunk {
+				chunk = remaining
+			}
+			if _, err = reader.ReadAt(buf[:chunk], pos); err != nil {
+				*bufPtr = buf
+				valueScanPool.Put(bufPtr)
+				return nil, nil, false, n, err
+			}
+			crc = crc32.Update(crc, crc32cTable, buf[:chunk])
+			pos += chunk
+			remaining -= chunk
+		}
+		if _, err = reader.ReadAt(buf[:RecordCRCSize], pos); err != nil {
+			*bufPtr = buf
+			valueScanPool.Put(bufPtr)
+			return nil, nil, false, n, err
+		}
+		stored := binary.BigEndian.Uint32(buf[:RecordCRCSize])
+		*bufPtr = buf
+		valueScanPool.Put(bufPtr)
+		if stored != crc {
+			return nil, nil, false, n, ErrCorrupt
+		}
+		n += int64(valLen) + RecordCRCSize
+		return key, nil, false, n, nil
+	}
+
 	compressed := flag == 1
 
 	// Value plus the trailing 4-byte CRC footer, read as one block.
@@ -308,14 +355,14 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 // last remap after an append) it refreshes the mapping once and retries,
 // instead of paying a failed mmap read, an allocated error and an fd read for
 // every record in a scan.
-func (f *File) readRecordShared(off int64, dstBuf, verify []byte) (key, value []byte, tombstone bool, n int64, err error) {
+func (f *File) readRecordShared(off int64, dstBuf, verify []byte, skipValue bool) (key, value []byte, tombstone bool, n int64, err error) {
 	f.mmapMu.RLock()
 	mm := f.mmap.Load()
 	if mm == nil {
 		f.mmapMu.RUnlock()
-		return f.readRecord(f.file, off, dstBuf, verify)
+		return f.readRecord(f.file, off, dstBuf, verify, skipValue)
 	}
-	key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify)
+	key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify, skipValue)
 	f.mmapMu.RUnlock()
 	if err == nil || errors.Is(err, ErrCorrupt) {
 		return
@@ -323,14 +370,14 @@ func (f *File) readRecordShared(off int64, dstBuf, verify []byte) (key, value []
 	if f.refreshMmap() {
 		f.mmapMu.RLock()
 		if mm = f.mmap.Load(); mm != nil {
-			key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify)
+			key, value, tombstone, n, err = f.readRecord(mm, off, dstBuf, verify, skipValue)
 		}
 		f.mmapMu.RUnlock()
 		if err == nil || errors.Is(err, ErrCorrupt) {
 			return
 		}
 	}
-	return f.readRecord(f.file, off, dstBuf, verify)
+	return f.readRecord(f.file, off, dstBuf, verify, skipValue)
 }
 
 // refreshMmap remaps only when the logical extent has grown past what is
@@ -363,7 +410,7 @@ func (f *File) ReadValueAt(off int64, key []byte, dstBuf []byte) ([]byte, error)
 	if f.closed.Load() {
 		return nil, ErrClosed
 	}
-	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key)
+	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key, false)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +426,7 @@ func (f *File) ReadAt(off int64, key []byte, dstBuf []byte) ([]byte, error) {
 	if f.closed.Load() {
 		return nil, ErrClosed
 	}
-	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key)
+	_, rVal, tombstone, _, err := f.readRecordShared(off, dstBuf, key, false)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +440,31 @@ func (f *File) ReadRecordAt(offset int64) (key, value []byte, tombstone bool, n 
 	if f.closed.Load() {
 		return nil, nil, false, 0, ErrClosed
 	}
-	return f.readRecordShared(offset, nil, nil)
+	return f.readRecordShared(offset, nil, nil, false)
+}
+
+// growTo extends the allocated extent to at least need bytes. The caller must
+// hold f.mu. Growth is geometric (25% or 64 KiB, whichever is larger) so
+// appends amortise to a handful of truncates instead of one every few records
+// once the initial preallocation is exhausted.
+func (f *File) growTo(need int64) error {
+	cur := f.allocatedSize.Load()
+	if need <= cur {
+		return nil
+	}
+	const minChunk = 64 << 10
+	next := cur + cur/4
+	if next < cur+minChunk {
+		next = cur + minChunk
+	}
+	if next < need {
+		next = need
+	}
+	if err := f.file.Truncate(next); err != nil {
+		return err
+	}
+	f.allocatedSize.Store(next)
+	return nil
 }
 
 // WriteAtomic uses the Offset Reservation Pattern (lock-free in the common case).
@@ -407,15 +478,11 @@ func (f *File) WriteAtomic(p []byte) (int64, error) {
 
 	if off+n > f.allocatedSize.Load() {
 		f.mu.Lock()
-		if off+n > f.allocatedSize.Load() {
-			newSize := off + n + (n * 4)
-			if err := f.file.Truncate(newSize); err != nil {
-				f.mu.Unlock()
-				return off, err
-			}
-			f.allocatedSize.Store(newSize)
-		}
+		err := f.growTo(off + n)
 		f.mu.Unlock()
+		if err != nil {
+			return off, err
+		}
 	}
 
 	_, err := f.file.WriteAt(p, off)
@@ -482,15 +549,11 @@ func (f *File) WriteRecord(key, value []byte) (int64, error) {
 	// Grow the file if the reservation exceeds the pre-allocated region.
 	if off+totalSize > f.allocatedSize.Load() {
 		f.mu.Lock()
-		if off+totalSize > f.allocatedSize.Load() {
-			newSize := off + totalSize + (totalSize * 4)
-			if err := f.file.Truncate(newSize); err != nil {
-				f.mu.Unlock()
-				return off, err
-			}
-			f.allocatedSize.Store(newSize)
-		}
+		err := f.growTo(off + totalSize)
 		f.mu.Unlock()
+		if err != nil {
+			return off, err
+		}
 	}
 
 	if _, err := f.file.WriteAt(buf, off); err != nil {
@@ -524,15 +587,11 @@ func (f *File) WriteTombstone(key []byte) error {
 
 	if off+totalSize > f.allocatedSize.Load() {
 		f.mu.Lock()
-		if off+totalSize > f.allocatedSize.Load() {
-			newSize := off + totalSize + (totalSize * 4)
-			if err := f.file.Truncate(newSize); err != nil {
-				f.mu.Unlock()
-				return err
-			}
-			f.allocatedSize.Store(newSize)
-		}
+		err := f.growTo(off + totalSize)
 		f.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err := f.file.WriteAt(buf, off)
@@ -638,7 +697,16 @@ func (f *File) nextNonZero(off, limit int64) (int64, bool) {
 			n = limit - off
 		}
 		m, err := f.file.ReadAt(buf[:n], off)
-		for i := 0; i < m; i++ {
+		i := 0
+		// Word-at-a-time scan: the zero prefix is the common case and is
+		// usually tens of MiB.
+		for ; i+8 <= m; i += 8 {
+			w := binary.LittleEndian.Uint64(buf[i:])
+			if w != 0 {
+				return off + int64(i) + int64(bits.TrailingZeros64(w)>>3), true
+			}
+		}
+		for ; i < m; i++ {
 			if buf[i] != 0 {
 				return off + int64(i), true
 			}
@@ -735,4 +803,52 @@ func fsyncDir(path string) {
 
 func (f *File) Compressor() *Compressor {
 	return f.compressor
+}
+
+// RecordSizeAt returns the on-disk size of the record at off without reading
+// or checksumming its value. It is a cheap estimator for compaction
+// fragmentation, not a validity check: use NextRecordStart/readRecord when
+// integrity matters.
+func (f *File) RecordSizeAt(off, limit int64) (int64, bool) {
+	if off < 0 || off+4 > limit {
+		return 0, false
+	}
+	var hdr [4]byte
+	if _, err := f.file.ReadAt(hdr[:], off); err != nil {
+		return 0, false
+	}
+	keyLen := int64(binary.BigEndian.Uint32(hdr[:]))
+	if keyLen < 1 || keyLen > int64(MaxLegalKeyLen) {
+		return 0, false
+	}
+	meta := off + 4 + keyLen
+	if meta+5 > limit {
+		return 0, false
+	}
+	var tail [5]byte
+	if _, err := f.file.ReadAt(tail[:], meta); err != nil {
+		return 0, false
+	}
+	valLen := int64(binary.BigEndian.Uint32(tail[:4]))
+	if valLen > int64(MaxLegalValLen) {
+		return 0, false
+	}
+	total := 4 + keyLen + 4 + 1 + valLen + RecordCRCSize
+	if total > limit-off {
+		return 0, false
+	}
+	return total, true
+}
+
+// ReadKeyAt returns the key and tombstone state of the record at off, plus its
+// on-disk size, without materializing the value. The value is streamed through
+// the CRC, so integrity is still checked. Index rebuild uses this: it needs
+// keys and offsets, not values, and the transient value allocations dominate
+// startup for large databases.
+func (f *File) ReadKeyAt(off int64) (key []byte, tombstone bool, n int64, err error) {
+	if f.closed.Load() {
+		return nil, false, 0, ErrClosed
+	}
+	key, _, tombstone, n, err = f.readRecordShared(off, nil, nil, true)
+	return key, tombstone, n, err
 }
