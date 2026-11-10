@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -171,5 +172,36 @@ func TestCacheGetSizesCopyToValue(t *testing.T) {
 	}
 	if cap(got) > 128 {
 		t.Fatalf("cache hit copy has cap %d for a 64-byte value; pool-sized buffer leaked", cap(got))
+	}
+}
+
+func TestCacheEvictsAboveCapacity(t *testing.T) {
+	cache := NewCache(100)
+	for i := 0; i < 4096; i++ { // a multiple of the eviction cadence
+		cache.Set([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
+	}
+	if n := cache.Len(); n > 100 {
+		t.Fatalf("cache len after eviction = %d, want <= 100", n)
+	}
+	for i := 0; i < 100; i++ {
+		if _, ok := cache.Get([]byte(fmt.Sprintf("k%d", 4095-i))); !ok {
+			// recently inserted entries should generally survive; this is a
+			// weak sanity check, not a strict LRU guarantee.
+			t.Logf("recent key k%d missing after eviction", 4095-i)
+		}
+	}
+}
+
+func BenchmarkCacheChurn(b *testing.B) {
+	cache := NewCache(10000)
+	val := bytes.Repeat([]byte("v"), 128)
+	keys := make([][]byte, 40000)
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("key-%d", i))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.Set(keys[i%len(keys)], val)
 	}
 }

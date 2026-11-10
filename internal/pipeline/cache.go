@@ -2,9 +2,11 @@ package pipeline
 
 import (
 	"bytes"
+	"sort"
 	"sync"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/olekukonko/mappo"
 	"github.com/zeebo/xxh3"
 )
@@ -33,13 +35,13 @@ type Cache struct {
 // If size <= 0, a default of 10000 is used.
 func NewCache(size int) *Cache {
 	if size <= 0 {
-		size = 10000
+		size = consts.DefaultCacheSize
 	}
 	return &Cache{
 		data: mappo.NewShardedWithConfig[uint64, cacheEntry](mappo.ShardedConfig{
-			ShardCount: 128,
+			ShardCount: consts.CacheShards,
 		}),
-		Pool: mappo.NewBytesPool(1024),
+		Pool: mappo.NewBytesPool(consts.CacheBufferSize),
 		size: size,
 	}
 }
@@ -111,13 +113,16 @@ func (c *Cache) Set(key, value []byte) {
 	c.data.Set(h, cacheEntry{key: keyCopy, val: valCopy, access: c.access.Add(1)})
 
 	// Check eviction every 1024 sets to avoid per-operation overhead.
-	if c.sets.Add(1)&1023 == 0 && c.data.Len() > c.size {
+	if c.sets.Add(1)&consts.CacheEvictCheckMask == 0 && c.data.Len() > c.size {
 		c.evict()
 	}
 }
 
-// evict removes the ~25% least-recently-accessed entries when over capacity.
-// It uses a simple sweep: collect entries below the median access timestamp.
+// evict removes the least-recently-accessed entries until the cache is at
+// 75% of capacity. It samples a bounded number of entries per pass instead of
+// sorting the whole cache: full-cache sorting dominated churn profiles.
+// Deleting from successive samples approximately preserves LRU while keeping
+// each eviction O(sample log sample) plus the number of victims.
 func (c *Cache) evict() {
 	c.evictMu.Lock()
 	defer c.evictMu.Unlock()
@@ -126,39 +131,49 @@ func (c *Cache) evict() {
 	if current <= c.size {
 		return
 	}
+	target := c.size * consts.CacheEvictTargetNum / consts.CacheEvictTargetDen
+	need := current - target
 
-	// Find a cutoff: scan to find the median access value.
-	var minAccess, maxAccess uint64
-	first := true
-	c.data.Range(func(_ uint64, e cacheEntry) bool {
-		if first {
-			minAccess = e.access
-			maxAccess = e.access
-			first = false
-		} else {
-			if e.access < minAccess {
-				minAccess = e.access
-			}
-			if e.access > maxAccess {
-				maxAccess = e.access
-			}
+	type victim struct {
+		hash   uint64
+		access uint64
+	}
+	// Scale the sample with the cache: a fixed 512 is fine for ~10k
+	// entries but would need thousands of passes on a large cache, while a
+	// huge sample reintroduces full sorts on small ones.
+	sampleSize := c.size / consts.CacheEvictSampleDivisor
+	if sampleSize < consts.CacheEvictSampleMin {
+		sampleSize = consts.CacheEvictSampleMin
+	}
+	if sampleSize > consts.CacheEvictSampleMax {
+		sampleSize = consts.CacheEvictSampleMax
+	}
+	victims := make([]victim, 0, sampleSize)
+	for need > 0 {
+		victims = victims[:0]
+		c.data.Range(func(h uint64, e cacheEntry) bool {
+			victims = append(victims, victim{hash: h, access: e.access})
+			return len(victims) < sampleSize
+		})
+		if len(victims) == 0 {
+			return
 		}
-		return true
-	})
-
-	cutoff := minAccess + (maxAccess-minAccess)/2
-	target := c.size * 3 / 4 // keep at least 75% of capacity
-
-	// Delete entries below the cutoff until we're under target.
-	c.data.Range(func(h uint64, e cacheEntry) bool {
-		if c.data.Len() <= target {
-			return false
+		sort.Slice(victims, func(i, j int) bool {
+			return victims[i].access < victims[j].access
+		})
+		take := need
+		if take > len(victims) {
+			take = len(victims)
 		}
-		if e.access < cutoff {
-			c.data.Delete(h)
+		for i := 0; i < take; i++ {
+			c.data.Delete(victims[i].hash)
 		}
-		return true
-	})
+		need -= take
+		if len(victims) < sampleSize {
+			// The whole cache fit in one sample; capacity is satisfied.
+			return
+		}
+	}
 }
 
 // Delete removes a key from the cache.
