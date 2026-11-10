@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/zeebo/xxh3"
 )
 
@@ -21,8 +22,8 @@ func NewHyperLogLog(precision uint8) *HyperLogLog {
 	if precision < 4 {
 		precision = 4
 	}
-	if precision > 16 {
-		precision = 16
+	if precision > consts.MaxCardinalityPrecision {
+		precision = consts.MaxCardinalityPrecision
 	}
 
 	m := uint64(1) << precision

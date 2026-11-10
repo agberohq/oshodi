@@ -3,6 +3,7 @@ package storage
 import (
 	"time"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/olekukonko/ll"
 )
 
@@ -21,10 +22,10 @@ type FileConfig struct {
 func DefaultFileConfig(path string) *FileConfig {
 	return &FileConfig{
 		Path:          path,
-		InitialSize:   20 << 20, // 20MB
-		BufferSize:    4 << 20,  // 4MB
-		RetryAttempts: 3,
-		RetryBackoff:  100 * time.Millisecond,
-		Logger:        ll.New("storage").Disable(),
+		InitialSize:   consts.DefaultInitialFileSize,
+		BufferSize:    consts.DefaultWriterBufferSize,
+		RetryAttempts: consts.GetAttempts,
+		RetryBackoff:  consts.StorageRetryBackoff,
+		Logger:        ll.New(consts.LoggerStorage).Disable(),
 	}
 }

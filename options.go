@@ -3,6 +3,7 @@ package oshodi
 import (
 	"time"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/pipeline"
 
 	"github.com/olekukonko/jack"
@@ -141,7 +142,7 @@ func WithFlushTimeout(timeout time.Duration) Option {
 func WithCardinality(precision uint8) Option {
 	return func(c *Config) {
 		c.EnableCardinality = true
-		if precision >= 10 && precision <= 16 {
+		if precision >= consts.MinCardinalityPrecision && precision <= consts.MaxCardinalityPrecision {
 			c.CardinalityPrecision = precision
 		}
 	}

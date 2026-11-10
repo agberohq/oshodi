@@ -3,6 +3,7 @@ package oshodi
 import (
 	"time"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/pipeline"
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
@@ -85,34 +86,34 @@ type Config struct {
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		ShardCount:              64,
-		QueueCapacity:           10000,
-		WriterBufferSize:        4 << 20,  // 4MB
-		InitialFileSize:         20 << 20, // 20MB
-		CacheSize:               10000,
-		PoolSize:                10,
-		BatchMinSize:            10,
-		BatchMaxSize:            1000,
-		BatchTimeout:            50 * time.Millisecond,
-		FlushTimeout:            10 * time.Second,
-		BloomExpectedItems:      1_000_000,
-		BloomFalsePositiveRate:  0.01,
+		ShardCount:              consts.DefaultShardCount,
+		QueueCapacity:           consts.DefaultQueueCapacity,
+		WriterBufferSize:        consts.DefaultWriterBufferSize,
+		InitialFileSize:         consts.DefaultInitialFileSize,
+		CacheSize:               consts.DefaultCacheSize,
+		PoolSize:                consts.DefaultPoolSize,
+		BatchMinSize:            consts.DefaultBatchMinSize,
+		BatchMaxSize:            consts.DefaultBatchMaxSize,
+		BatchTimeout:            consts.DefaultBatchTimeout,
+		FlushTimeout:            consts.DefaultFlushTimeout,
+		BloomExpectedItems:      consts.DefaultBloomExpectedItems,
+		BloomFalsePositiveRate:  consts.DefaultBloomFalsePositiveRate,
 		EnableCompression:       false,
-		CompressionThreshold:    4096,
+		CompressionThreshold:    consts.DefaultCompressionThreshold,
 		CompressionLevel:        0,
-		CompactionMinItems:      1000,
-		CompactionFragmentation: 0.3,
-		CompactionInterval:      30 * time.Minute,
+		CompactionMinItems:      consts.DefaultCompactionMinItems,
+		CompactionFragmentation: consts.DefaultCompactionFragmentation,
+		CompactionInterval:      consts.DefaultCompactionInterval,
 		EnableCardinality:       false, // opt-in via WithCardinality()
-		CardinalityPrecision:    14,
+		CardinalityPrecision:    consts.DefaultCardinalityPrecision,
 		EnableFrequency:         false, // opt-in via WithFrequency()
-		Logger:                  ll.New("oshodi").Disable().Suspend(),
+		Logger:                  ll.New(consts.AppName).Disable().Suspend(),
 		// DisableWAL by default: no WAL overhead, main storage durability
 		// only. Enable via WithWAL(true) and choose sync/async durability
 		// via WithWALSyncMode.
-		WALMaxBufSize: 4 * 1024 * 1024, // 4MB
+		WALMaxBufSize: consts.DefaultWALMaxBufferSize,
 		DisableWAL:    true,
-		MaxKeySize:    1 << 20, // 1MB cap keeps the decoder unambiguous
-		MaxValueSize:  1 << 30,
+		MaxKeySize:    consts.DefaultMaxKeySize, // keeps the decoder unambiguous
+		MaxValueSize:  consts.DefaultMaxValueSize,
 	}
 }

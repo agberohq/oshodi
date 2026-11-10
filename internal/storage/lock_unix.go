@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"github.com/agberohq/oshodi/internal/consts"
 	"io"
 	"os"
 	"syscall"
@@ -13,7 +14,7 @@ import (
 // processes from opening the same database file. Nil closer releases it.
 // Unsupported platforms (see lock_windows.go) return a no-op closer.
 func AcquireFileLock(path string) (io.Closer, error) {
-	f, err := os.OpenFile(path+FilenameSuffixLock, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(path+FilenameSuffixLock, os.O_CREATE|os.O_RDWR, consts.FileMode)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"math"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/zeebo/xxh3"
 )
 
@@ -21,7 +22,7 @@ func NewBloomFilter(expectedItems uint, falsePositiveRate float64) *BloomFilter 
 		expectedItems = 1
 	}
 	if falsePositiveRate <= 0 || falsePositiveRate >= 1 {
-		falsePositiveRate = 0.01
+		falsePositiveRate = consts.DefaultBloomFalsePositiveRate
 	}
 
 	m := uint64(math.Ceil(-float64(expectedItems) * math.Log(falsePositiveRate) / (math.Ln2 * math.Ln2)))

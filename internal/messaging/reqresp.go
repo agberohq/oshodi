@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/olekukonko/mappo"
 )
 
@@ -25,7 +26,7 @@ var resultPool = sync.Pool{
 
 // timerPool reuses time.Timer values to avoid per-call heap allocations.
 var timerPool = sync.Pool{
-	New: func() any { return time.NewTimer(time.Hour) },
+	New: func() any { return time.NewTimer(consts.TimerIdle) },
 }
 
 // ReqResp manages named request/response handlers using a sharded map.
@@ -37,7 +38,7 @@ type ReqResp struct {
 // NewReqResp creates a new ReqResp instance.
 func NewReqResp(timeout time.Duration) *ReqResp {
 	if timeout == 0 {
-		timeout = 5 * time.Second
+		timeout = consts.ReqRespDefaultTimeout
 	}
 	return &ReqResp{
 		handlers: mappo.NewSharded[string, HandlerFunc](),

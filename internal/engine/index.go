@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/metrics"
 	"github.com/olekukonko/mappo"
 )
@@ -16,7 +17,7 @@ type Index struct {
 func NewIndex(expectedItems uint, falsePositiveRate float64) *Index {
 	return &Index{
 		shards: mappo.NewShardedWithConfig[string, int64](mappo.ShardedConfig{
-			ShardCount: 128,
+			ShardCount: consts.IndexShards,
 		}),
 		bloom: metrics.NewBloomFilter(expectedItems, falsePositiveRate),
 	}

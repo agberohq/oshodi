@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"github.com/agberohq/oshodi/internal/consts"
 	"sync"
 	"time"
 
@@ -50,8 +51,8 @@ func newWriteCoalescer(shards, batchMin, maxBatch, queueTotal int, batchTimeout 
 		n <<= 1
 	}
 	perShard := queueTotal / shards
-	if perShard < 16 {
-		perShard = 16
+	if perShard < consts.MinCoalescePerShard {
+		perShard = consts.MinCoalescePerShard
 	}
 	if batchMin <= 0 {
 		batchMin = 1

@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"github.com/agberohq/oshodi/internal/consts"
 	"io"
 	"os"
 )
@@ -10,7 +11,7 @@ import (
 // AcquireFileLock is a no-op on Windows (see lock_unix.go for the contract).
 // Windows file locking is wired separately once needed.
 func AcquireFileLock(path string) (io.Closer, error) {
-	f, err := os.OpenFile(path+FilenameSuffixLock, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(path+FilenameSuffixLock, os.O_CREATE|os.O_RDWR, consts.FileMode)
 	if err != nil {
 		return nil, err
 	}

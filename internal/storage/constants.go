@@ -2,7 +2,8 @@ package storage
 
 import (
 	"hash/crc32"
-	"time"
+
+	"github.com/agberohq/oshodi/internal/consts"
 )
 
 // Disk artifact naming and record-encoding constants.
@@ -19,9 +20,12 @@ const (
 	FilenameSuffixLock = ".lock"
 
 	// DefaultWALFlushInterval is the asynchronous WAL flusher period.
-	DefaultWALFlushInterval = 10 * time.Millisecond
+	DefaultWALFlushInterval = consts.DefaultWALFlushInterval
 	// DefaultWALBufferSize is the WAL flush batch budget.
-	DefaultWALBufferSize = 4 << 20 // 4MB
+	DefaultWALBufferSize = consts.DefaultWALMaxBufferSize
+
+	// DefaultWALFilename is used when a WAL config omits its path.
+	DefaultWALFilename = "wal.log"
 
 	// WALTombstoneValLen is the value-length sentinel stored in WAL
 	// tombstones so deletions can never be confused with a regular
@@ -56,7 +60,7 @@ const (
 const (
 	// MaxLegalKeyLen caps key length on decode and write so a corrupt
 	// length prefix can never cause a multi-gigabyte allocation.
-	MaxLegalKeyLen uint32 = 0x00FFFFFF
+	MaxLegalKeyLen = consts.MaxLegalKeyLen
 	// MaxLegalValLen caps value length on decode for the same reason.
-	MaxLegalValLen uint32 = 1 << 30
+	MaxLegalValLen = consts.MaxLegalValLen
 )

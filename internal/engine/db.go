@@ -13,6 +13,7 @@ import (
 
 	"io"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/messaging"
 	"github.com/agberohq/oshodi/internal/metrics"
 	"github.com/agberohq/oshodi/internal/pipeline"
@@ -29,8 +30,6 @@ var (
 	ErrKeyTooLarge   = errors.New("oshodi: key exceeds configured maximum size")
 	ErrValueTooLarge = errors.New("oshodi: value exceeds configured maximum size")
 )
-
-const DefaultMaxKeySize = 1 << 20 // 1MB
 
 type DBStats struct {
 	NumKeys         int
@@ -178,16 +177,16 @@ func NewDB(config *Config) (*DB, error) {
 		config.SplitMutexShards = DefaultShardCount
 	}
 	if config.Logger == nil {
-		config.Logger = ll.New("oshodi").Disable()
+		config.Logger = ll.New(consts.AppName).Disable()
 	}
 	if config.CardinalityPrecision == 0 {
-		config.CardinalityPrecision = 14
+		config.CardinalityPrecision = consts.DefaultCardinalityPrecision
 	}
 	if config.BloomExpectedItems == 0 {
-		config.BloomExpectedItems = 1_000_000
+		config.BloomExpectedItems = consts.DefaultBloomExpectedItems
 	}
 	if config.BloomFalsePositiveRate == 0 {
-		config.BloomFalsePositiveRate = 0.01
+		config.BloomFalsePositiveRate = consts.DefaultBloomFalsePositiveRate
 	}
 	if config.MaxKeySize <= 0 {
 		config.MaxKeySize = DefaultMaxKeySize
@@ -299,12 +298,12 @@ func NewDB(config *Config) (*DB, error) {
 	db.storage.Store(store)
 	db.index.Store(idx)
 	db.pubsub = messaging.NewPubSub(pool, config.Logger, config.Hooks, config.PubSubPayloadCopy)
-	db.handlers = messaging.NewReqResp(5 * time.Second)
+	db.handlers = messaging.NewReqResp(consts.ReqRespDefaultTimeout)
 
 	// Initialise WAL only if explicitly enabled (disabled by default for performance)
 	if !config.DisableWAL {
 		if config.WALMaxBufSize <= 0 {
-			config.WALMaxBufSize = 4 * 1024 * 1024
+			config.WALMaxBufSize = consts.DefaultWALMaxBufferSize
 		}
 		walCfg := newWALConfig(config, config.FilePath+storage.FilenameSuffixWAL)
 		wal, err := storage.NewWAL(walCfg)
@@ -376,7 +375,7 @@ func NewDB(config *Config) (*DB, error) {
 	if db.doctor != nil {
 		db.doctor.Add(jack.NewPatient(jack.PatientConfig{
 			ID:       "oshodi.storage",
-			Interval: 30 * time.Second,
+			Interval: consts.DoctorInterval,
 			Check:    db.healthCheck,
 		}))
 	}
@@ -410,7 +409,7 @@ func NewDB(config *Config) (*DB, error) {
 					"estimated_keys", stats.EstimatedKeys,
 				).Debug("oshodi metrics")
 				scheduleMetrics()
-			}), 1*time.Minute)
+			}), consts.MetricsInterval)
 		}
 		scheduleMetrics()
 	} else {
@@ -1056,7 +1055,7 @@ func estimateLiveBytes(idx *Index, store *storage.File, logical int64) int64 {
 	if n <= 0 || logical <= 0 {
 		return 0
 	}
-	const maxSamples = 1024
+	const maxSamples = consts.CompactionSampleSize
 	stride := n/maxSamples + 1
 	var sampled, live int64
 	i := 0
@@ -1108,7 +1107,7 @@ func (db *DB) processCompaction() {
 // It runs every minute when no lifetime manager is provided.
 func (db *DB) metricsReporter() {
 	defer db.wg.Done()
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(consts.MetricsInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1262,7 +1261,7 @@ func (db *DB) Close() error {
 			}
 		}
 		if db.ownPool && db.pool != nil {
-			db.pool.Shutdown(30 * time.Second)
+			db.pool.Shutdown(consts.PoolShutdownTimeout)
 		}
 		if db.lockFile != nil {
 			_ = db.lockFile.Close()

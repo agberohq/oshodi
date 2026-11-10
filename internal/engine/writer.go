@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/storage"
 	"github.com/olekukonko/jack"
 	"github.com/zeebo/xxh3"
@@ -34,7 +35,7 @@ type ShardedWriterConfig struct {
 func NewShardedWriter(cfg ShardedWriterConfig) (*ShardedWriter, error) {
 	shardCount := cfg.ShardCount
 	if shardCount <= 0 {
-		shardCount = 64
+		shardCount = consts.DefaultShardCount
 	}
 
 	// Round up to power of 2 for fast bitwise masking
@@ -52,7 +53,7 @@ func NewShardedWriter(cfg ShardedWriterConfig) (*ShardedWriter, error) {
 		encoderPool: sync.Pool{
 			New: func() interface{} {
 				// 32KB pre-allocation for Batch writes to eliminate mallocs
-				b := make([]byte, 0, 32768)
+				b := make([]byte, 0, consts.WriterEncoderBuffer)
 				return &b
 			},
 		},
@@ -64,7 +65,7 @@ func NewShardedWriter(cfg ShardedWriterConfig) (*ShardedWriter, error) {
 			bufferPool: sync.Pool{
 				New: func() interface{} {
 					// 1KB pre-allocation for single record writes
-					b := make([]byte, 0, 1024)
+					b := make([]byte, 0, consts.WriterRecordBuffer)
 					return &b
 				},
 			},

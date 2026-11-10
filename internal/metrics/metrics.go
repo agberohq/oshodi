@@ -1,5 +1,7 @@
 package metrics
 
+import "github.com/agberohq/oshodi/internal/consts"
+
 // Manager coordinates zero-lock global database analytics.
 // Eliminated the internal mappo.Concurrent lookup to ensure 0 map lookups on the database insertion hot path.
 // The Bloom filter is NOT managed here; it is owned by the Index to avoid duplicate updates.
@@ -22,7 +24,7 @@ func NewManager(enableCardinality bool, precision uint8, enableFrequency bool) *
 		m.globalHLL = NewHyperLogLog(precision)
 	}
 	if enableFrequency {
-		m.globalSketch = NewCountMinSketch(0.01, 0.99)
+		m.globalSketch = NewCountMinSketch(consts.CMSDefaultEpsilon, consts.CMSDefaultConfidence)
 	}
 
 	return m

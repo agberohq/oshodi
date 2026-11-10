@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -15,13 +16,13 @@ type Compressor struct {
 // NewCompressor creates a new compressor with the given threshold and compression level.
 func NewCompressor(threshold, level int) (*Compressor, error) {
 	if threshold <= 0 {
-		threshold = 4096
+		threshold = consts.DefaultCompressionThreshold
 	}
 	if level < 0 {
 		level = 0
 	}
-	if level > 9 {
-		level = 9
+	if level > consts.MaxCompressionLevel {
+		level = consts.MaxCompressionLevel
 	}
 
 	encoderLevel := zstd.EncoderLevelFromZstd(level)

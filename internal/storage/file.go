@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/olekukonko/ll"
 	"golang.org/x/exp/mmap"
 )
@@ -28,7 +29,7 @@ var (
 // Max key size is ~4KB for typical workloads; pool covers the common case.
 var metaBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 0, 4096)
+		b := make([]byte, 0, consts.MetaBufferSize)
 		return &b
 	},
 }
@@ -37,7 +38,7 @@ var metaBufPool = sync.Pool{
 // materialising its value (index rebuild).
 var valueScanPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 64<<10)
+		b := make([]byte, consts.ScanBufferSize)
 		return &b
 	},
 }
@@ -45,7 +46,7 @@ var valueScanPool = sync.Pool{
 // cacheLinePad is the size of a CPU cache line on all supported architectures
 // (64 bytes on x86/arm64). Fields on separate cache lines never cause
 // false-sharing invalidations when written concurrently.
-const cacheLinePad = 64
+const cacheLinePad = consts.CacheLineSize
 
 type File struct {
 	file   *os.File
@@ -92,7 +93,7 @@ func NewFile(cfg *FileConfig) (*File, error) {
 		return nil, errors.New("storage: config is nil")
 	}
 
-	f, err := os.OpenFile(cfg.Path, os.O_RDWR|os.O_CREATE, 0600)
+	f, err := os.OpenFile(cfg.Path, os.O_RDWR|os.O_CREATE, consts.FileMode)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +116,7 @@ func NewFile(cfg *FileConfig) (*File, error) {
 	}
 
 	if file.logger == nil {
-		file.logger = ll.New("storage").Disable()
+		file.logger = ll.New(consts.LoggerStorage).Disable()
 	}
 
 	if fileSize == 0 && cfg.InitialSize > 0 {
@@ -161,7 +162,7 @@ func (f *File) remap() error {
 // invalidation entirely.
 func (f *File) remapLoop() {
 	defer f.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(consts.RemapInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -452,7 +453,7 @@ func (f *File) growTo(need int64) error {
 	if need <= cur {
 		return nil
 	}
-	const minChunk = 64 << 10
+	const minChunk = consts.MinGrowChunk
 	next := cur + cur/4
 	if next < cur+minChunk {
 		next = cur + minChunk
@@ -689,7 +690,7 @@ func (f *File) NextRecordStart(off, limit int64) (int64, bool) {
 
 // nextNonZero returns the offset of the first non-zero byte in [off, limit).
 func (f *File) nextNonZero(off, limit int64) (int64, bool) {
-	const window = 64 << 10
+	const window = consts.ScanBufferSize
 	buf := make([]byte, window)
 	for off < limit {
 		n := int64(len(buf))
