@@ -727,16 +727,14 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 	}
 
 	if wal := db.wal.Load(); wal != nil {
-		for _, k := range keys {
-			_, err := wal.WriteTombstone(context.Background(), k)
-			if err != nil && errors.Is(err, storage.ErrWALClosed) {
-				if newWal := db.wal.Load(); newWal != nil && newWal != wal {
-					_, err = newWal.WriteTombstone(context.Background(), k)
-				}
+		err := wal.BatchWriteTombstones(context.Background(), keys)
+		if err != nil && errors.Is(err, storage.ErrWALClosed) {
+			if newWal := db.wal.Load(); newWal != nil && newWal != wal {
+				err = newWal.BatchWriteTombstones(context.Background(), keys)
 			}
-			if err != nil {
-				return err
-			}
+		}
+		if err != nil {
+			return err
 		}
 	}
 

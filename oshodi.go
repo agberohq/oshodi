@@ -356,6 +356,15 @@ func (b *Bucket) Get(key []byte) ([]byte, error) {
 	return b.inner.Get(key)
 }
 
+// GetterMany resolves keys in order and calls fn for each present value,
+// skipping missing keys. Values are only valid until fn returns.
+func (b *Bucket) GetterMany(keys [][]byte, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.GetterMany(keys, fn)
+}
+
 // Getter retrieves a value and passes it to fn without making an owned copy.
 // The slice is only valid until fn returns; copy it to retain it, and do not
 // mutate it. Use Get when you need an owned copy.

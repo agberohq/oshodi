@@ -851,3 +851,75 @@ func TestBucketBatchDelete(t *testing.T) {
 		}
 	}
 }
+
+func TestBucketBatchDeleteWithWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batchdel-wal.db")
+	db, err := Open(path, WithWAL(true))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	b := db.Bucket("b")
+	for _, k := range []string{"a", "b", "c", "d"} {
+		if err := b.Set([]byte(k), []byte(k)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+	if err := b.BatchDelete([][]byte{[]byte("a"), []byte("c")}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err = Open(path, WithWAL(true))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	b = db.Bucket("b")
+	if all, err := b.GetAll(); err != nil || len(all) != 2 {
+		t.Fatalf("after reopen = %d records, %v; want 2", len(all), err)
+	}
+	for _, k := range []string{"a", "c"} {
+		if _, err := b.Get([]byte(k)); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("%q resurrected: %v", k, err)
+		}
+	}
+}
+
+func TestBucketGetterMany(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gettermany.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	b := db.Bucket("b")
+	for _, k := range []string{"a", "b", "c"} {
+		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+
+	got := map[string]string{}
+	err = b.GetterMany([][]byte{
+		[]byte("a"), []byte("missing"), []byte("c"),
+	}, func(k, v []byte) error {
+		got[string(k)] = string(v) // copy before reuse
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("GetterMany: %v", err)
+	}
+	if len(got) != 2 || got["a"] != "v-a" || got["c"] != "v-c" {
+		t.Fatalf("GetterMany values = %v", got)
+	}
+
+	want := errors.New("stop")
+	if err := b.GetterMany([][]byte{[]byte("a"), []byte("b")}, func(k, v []byte) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("callback error = %v, want %v", err, want)
+	}
+	if err := b.GetterMany(nil, func(k, v []byte) error { return nil }); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}

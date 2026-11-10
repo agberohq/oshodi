@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"strings"
+
+	"github.com/agberohq/oshodi/internal/consts"
 )
 
 // bucketKeySeparator joins the bucket name and the user key/channel/handler
 // name to build the fully-qualified key.
-const bucketKeySeparator = "\x00"
+const bucketKeySeparator = consts.KeySeparator
 
 // Bucket represents a namespaced collection
 type Bucket struct {
@@ -99,6 +101,33 @@ func (b *Bucket) BatchDelete(keys [][]byte) error {
 		namespaced[i] = b.makeKey(k)
 	}
 	return b.db.BatchDelete(namespaced)
+}
+
+// GetterMany resolves each key in order and passes present values to fn
+// without an owned copy. Missing keys are skipped; values are callback-scoped.
+func (b *Bucket) GetterMany(keys [][]byte, fn func(key, value []byte) error) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	var fullKey []byte
+	for _, k := range keys {
+		if len(k) == 0 {
+			continue
+		}
+		fullKey = append(fullKey[:0], b.prefix...)
+		fullKey = append(fullKey, k...)
+		err := b.db.Getter(fullKey, func(v []byte) error { return fn(k, v) })
+		if err == ErrKeyNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Getter is Get without an owned value copy: value is only valid until fn
