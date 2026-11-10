@@ -267,3 +267,37 @@ func BenchmarkPubSubPublish(b *testing.B) {
 		ps.Publish("", channel, payload)
 	}
 }
+
+// TestPublishIsolatesCallerPayload pins the async ownership rule: Publish
+// returns before subscribers run, so mutating the caller's buffer must not
+// change what they see.
+func TestPublishIsolatesCallerPayload(t *testing.T) {
+	pool := jack.NewPool(4)
+	ps := NewPubSub(pool, nil, nil, false)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	got := make(chan string, 1)
+	ps.SubscribeSimple("", "ch", func(p []byte) {
+		close(started)
+		<-release
+		got <- string(p)
+	})
+
+	payload := []byte("original")
+	if _, err := ps.Publish("", "ch", payload); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	<-started
+	payload[0] = 'X'
+	close(release)
+
+	select {
+	case v := <-got:
+		if v != "original" {
+			t.Fatalf("subscriber saw %q; Publish did not isolate the caller's buffer", v)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for delivery")
+	}
+}

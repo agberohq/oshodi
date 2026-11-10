@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/agberohq/oshodi/internal/pipeline"
 	"github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
@@ -58,7 +59,7 @@ type subEntry struct {
 // subEntryPool reuses the slice header for subscriber snapshots.
 var subEntryPool = sync.Pool{
 	New: func() any {
-		b := make([]subEntry, 0, 64)
+		b := make([]subEntry, 0, consts.PubSubSnapshotCap)
 		return &b
 	},
 }
@@ -78,14 +79,14 @@ type PubSub struct {
 	nextID atomic.Int64
 	hooks  *pipeline.Hooks
 	// copyPayload: each subscriber receives its own payload copy instead of
-	// the shared slice. Default off (subscribers must not mutate payloads).
+	// one copy shared by all subscribers. Default off.
 	copyPayload bool
 }
 
 // NewPubSub creates a new PubSub instance
 func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks, copyPayload bool) *PubSub {
 	if logger == nil {
-		logger = ll.New("pubsub").Disable()
+		logger = ll.New(consts.LoggerPubSub).Disable()
 	}
 	return &PubSub{
 		channels:    mappo.NewSharded[string, *Channel](),
@@ -97,7 +98,7 @@ func NewPubSub(pool *jack.Pool, logger *ll.Logger, hooks *pipeline.Hooks, copyPa
 }
 
 // channelSeparator joins the bucket-qualified channel name.
-const channelSeparator = "\x00"
+const channelSeparator = consts.KeySeparator
 
 func chanKey(bucket, channel string) string {
 	if bucket == "" {
@@ -153,14 +154,23 @@ func (ps *PubSub) unsubscribeByID(bucket, channel string, id int64) {
 // UnsubscribeAll removes all subscribers from a channel
 func (ps *PubSub) UnsubscribeAll(bucket, channel string) {
 	key := chanKey(bucket, channel)
-	if ch, ok := ps.channels.Get(key); ok {
+	// chanMu closes the race with Subscribe's GetOrSet: without it a
+	// concurrent Subscribe can install a subscriber into a channel that this
+	// call deletes immediately afterwards.
+	ps.chanMu.Lock()
+	ch, ok := ps.channels.Get(key)
+	if ok {
 		ps.channels.Delete(key)
-		if ps.hooks != nil && ps.hooks.OnUnsubscribe != nil {
-			ch.subs.Range(func(id int64, _ func([]byte)) bool {
-				ps.hooks.OnUnsubscribe(bucket, channel, id)
-				return true
-			})
-		}
+	}
+	ps.chanMu.Unlock()
+	if !ok {
+		return
+	}
+	if ps.hooks != nil && ps.hooks.OnUnsubscribe != nil {
+		ch.subs.Range(func(id int64, _ func([]byte)) bool {
+			ps.hooks.OnUnsubscribe(bucket, channel, id)
+			return true
+		})
 	}
 }
 
@@ -185,6 +195,11 @@ func (ps *PubSub) IDs(bucket, channel string) []int64 {
 // Publish sends a payload to all subscribers of a channel.
 // It snapshots the subscriber list first to avoid holding the sharded map
 // during dispatch, then submits each subscriber as a pooled job.
+//
+// Dispatch is asynchronous, so the payload is copied once (or once per
+// subscriber when copyPayload is set) before the call returns; callers may
+// reuse or mutate their buffer immediately. Subscribers must not mutate the
+// payload they receive.
 func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 	if ps.hooks != nil && ps.hooks.OnPublish != nil {
 		var err error
@@ -214,6 +229,14 @@ func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 		return 0, nil
 	}
 
+	// Jobs run after Publish returns, so the caller's buffer must not be
+	// referenced. With copyPayload off, one owned copy is shared by all
+	// subscribers; with it on, each gets an independent copy.
+	var shared []byte
+	if !ps.copyPayload {
+		shared = append([]byte(nil), payload...)
+	}
+
 	submitted := 0
 	for i := range entries {
 		e := &entries[i]
@@ -222,7 +245,7 @@ func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 		if ps.copyPayload {
 			job.payload = append([]byte(nil), payload...)
 		} else {
-			job.payload = payload
+			job.payload = shared
 		}
 		job.logger = ps.logger
 		job.id = e.id
@@ -241,7 +264,8 @@ func (ps *PubSub) Publish(bucket, channel string, payload []byte) (int, error) {
 		submitted++
 	}
 
-	// Reset and recycle the snapshot slice.
+	// Drop the subscriber references before recycling the snapshot.
+	clear(entries)
 	*entriesPtr = entries[:0]
 	subEntryPool.Put(entriesPtr)
 
