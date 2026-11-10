@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/agberohq/oshodi/internal/consts"
 	"hash/crc32"
 	"io"
 	"os"
@@ -79,13 +80,13 @@ type WAL struct {
 
 func NewWAL(cfg *WALConfig) (*WAL, error) {
 	if cfg == nil {
-		cfg = DefaultWALConfig("wal.log")
+		cfg = DefaultWALConfig(DefaultWALFilename)
 	}
 	if cfg.FlushInterval <= 0 {
-		cfg.FlushInterval = 10 * time.Millisecond
+		cfg.FlushInterval = consts.DefaultWALFlushInterval
 	}
 
-	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_RDWR, consts.FileMode)
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +220,49 @@ func (w *WAL) WriteTombstone(ctx context.Context, key []byte) (int64, error) {
 	return offset, nil
 }
 
+// BatchWriteTombstones appends deletion markers for every key under one mutex
+// section. It is used by batched deletes: one owned copy of all keys replaces
+// one allocation and lock acquisition per key.
+func (w *WAL) BatchWriteTombstones(ctx context.Context, keys [][]byte) error {
+	if w.closed.Load() {
+		return ErrWALClosed
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	total := 0
+	for _, k := range keys {
+		if len(k) == 0 {
+			return ErrWALCorrupted
+		}
+		total += len(k)
+	}
+
+	buf := make([]byte, total)
+	recs := make([]record, len(keys))
+	pos := 0
+	w.mu.Lock()
+	for i, k := range keys {
+		copy(buf[pos:], k)
+		owned := buf[pos : pos+len(k)]
+		pos += len(k)
+		rl := w.recordLen(k, nil, true)
+		offset := w.filePos.Add(int64(rl)) - int64(rl)
+		recs[i] = record{offset: offset, key: owned, tomb: true}
+	}
+	w.pending = append(w.pending, recs...)
+	w.mu.Unlock()
+
+	if w.mode == SyncMode {
+		return w.flushToDisk()
+	}
+	select {
+	case w.flushCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func (w *WAL) flushToDisk() error {
 	// mu is held for the whole flush so concurrent flush triggers cannot
 	// interleave writes at the same file offset.
@@ -333,7 +377,17 @@ func (w *WAL) readRecordAt(offset int64) (key, value []byte, tomb bool, next int
 	valLen := binary.LittleEndian.Uint32(valLenBuf[:])
 
 	if valLen == WALTombstoneValLen {
-		return key, nil, true, valOffset + 4, nil
+		// Tombstones carry the same CRC trailer as value records; advancing
+		// past only the length field would land inside the trailer and make
+		// recovery truncate the WAL at the first tombstone.
+		var crcBuf [RecordCRCSize]byte
+		if _, err = w.file.ReadAt(crcBuf[:], valOffset+4); err != nil {
+			return
+		}
+		if binary.LittleEndian.Uint32(crcBuf[:]) != walRecordCRC(keyLen, key, valLen, nil) {
+			return nil, nil, false, offset, ErrWALCorrupted
+		}
+		return key, nil, true, valOffset + 4 + RecordCRCSize, nil
 	}
 	if valLen > MaxLegalValLen {
 		return nil, nil, false, offset, ErrWALCorrupted
@@ -415,30 +469,10 @@ func (w *WAL) Flush(ctx context.Context) error {
 	if w.closed.Load() {
 		return ErrWALClosed
 	}
-
-	if w.mode == SyncMode {
-		return w.flushToDisk()
-	}
-
-	done := make(chan struct{}, 1)
-
-	select {
-	case w.flushCh <- struct{}{}:
-	default:
-	}
-
-	go func() {
-		w.mu.Lock()
-		w.mu.Unlock()
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	// Flush synchronously. Signalling the background flusher and waiting for
+	// a mutex acquisition did not guarantee that the write had happened, so
+	// Flush could return with records still only in memory.
+	return w.flushToDisk()
 }
 
 func (w *WAL) Close() error {

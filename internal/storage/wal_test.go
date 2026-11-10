@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/binary"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -376,4 +377,106 @@ func BenchmarkWALParallelWrite(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestWALBatchWriteTombstones(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch.wal")
+	cfg := DefaultWALConfig(path)
+	cfg.Mode = SyncMode // Flush is synchronous, no async-flush race
+	w, err := NewWAL(cfg)
+	if err != nil {
+		t.Fatalf("wal: %v", err)
+	}
+	keys := [][]byte{[]byte("a"), []byte("bucket\x00b"), []byte("ccc")}
+	if err := w.BatchWriteTombstones(context.Background(), keys); err != nil {
+		t.Fatalf("batch tombstones: %v", err)
+	}
+	if err := w.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	readAll := func(w *WAL) []string {
+		t.Helper()
+		r := w.NewReader(0)
+		var got []string
+		for {
+			data, err := r.ReadNext(nil)
+			if err != nil {
+				break
+			}
+			if len(data) < 8 {
+				t.Fatalf("short record: %d", len(data))
+			}
+			keyLen := binary.LittleEndian.Uint32(data[0:4])
+			if int(keyLen)+8 > len(data) {
+				t.Fatalf("bad key length %d", keyLen)
+			}
+			valLen := binary.LittleEndian.Uint32(data[4+keyLen : 8+keyLen])
+			if valLen != WALTombstoneValLen {
+				t.Fatalf("record %q is not a tombstone: valLen=%d", data[4:4+keyLen], valLen)
+			}
+			got = append(got, string(data[4:4+keyLen]))
+		}
+		return got
+	}
+	got := readAll(w)
+	if len(got) != len(keys) {
+		t.Fatalf("read %d tombstones, want %d", len(got), len(keys))
+	}
+	for i := range keys {
+		if got[i] != string(keys[i]) {
+			t.Fatalf("tombstone %d = %q, want %q", i, got[i], keys[i])
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The batched records must be durable and recover on reopen.
+	cfg2 := DefaultWALConfig(path)
+	cfg2.Mode = SyncMode
+	w2, err := NewWAL(cfg2)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer w2.Close()
+	if got := readAll(w2); len(got) != len(keys) {
+		t.Fatalf("after reopen read %d tombstones, want %d", len(got), len(keys))
+	}
+}
+
+// TestWALFlushIsSynchronous pins the Flush contract in async mode: after it
+// returns the records must be readable from the file, not still pending.
+func TestWALFlushIsSynchronous(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flush.wal")
+	cfg := DefaultWALConfig(path)
+	cfg.Mode = AsyncMode
+	w, err := NewWAL(cfg)
+	if err != nil {
+		t.Fatalf("wal: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.BatchWriteTombstones(context.Background(), [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// Read directly from the file through a fresh reader; if Flush only
+	// signalled the flusher, this can see nothing.
+	r := w.NewReader(0)
+	n := 0
+	for {
+		data, err := r.ReadNext(nil)
+		if err != nil {
+			break
+		}
+		if len(data) >= 4 {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("after Flush read %d records from disk, want 2", n)
+	}
 }
