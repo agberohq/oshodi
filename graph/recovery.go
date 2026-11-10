@@ -10,16 +10,14 @@ import (
 // defensively dropped.
 func (g *Graph) rebuild() error {
 	g.adj = newAdjacency()
-	// Resolve the vertex set once. Checking endpoints with a point lookup per
-	// edge would read and materialise every endpoint record twice.
-	ids, err := g.allVertexIDs()
+	// Resolve vertices and their immutable labels in one scan. This replaces
+	// both the 2-per-edge endpoint point reads and the per-vertex label reads
+	// used by HasLabel.
+	index, err := g.loadVertexIndex()
 	if err != nil {
 		return fmt.Errorf("graph: rebuild vertices: %w", err)
 	}
-	vertices := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		vertices[id] = struct{}{}
-	}
+	g.vertexIndex = index
 	var dangling []string
 
 	err = g.edges.ScannerE(nil, func(key []byte, value []byte) error {
@@ -29,11 +27,11 @@ func (g *Graph) rebuild() error {
 			return nil
 		}
 		id := string(key)
-		if _, ok := vertices[src]; !ok {
+		if _, ok := g.vertexIndex[src]; !ok {
 			dangling = append(dangling, id)
 			return nil
 		}
-		if _, ok := vertices[dst]; !ok {
+		if _, ok := g.vertexIndex[dst]; !ok {
 			dangling = append(dangling, id)
 			return nil
 		}
@@ -53,14 +51,34 @@ func (g *Graph) rebuild() error {
 	return nil
 }
 
-// allVertexIDs enumerates every vertex id (isolated vertices included).
-func (g *Graph) allVertexIDs() ([]string, error) {
-	var ids []string
-	err := g.vertices.ScannerE(nil, func(key []byte, _ []byte) error {
-		ids = append(ids, string(key))
+// loadVertexIndex scans the vertex bucket once, decoding labels and counting
+// corrupt records. A corrupt vertex remains addressable (so its edges are not
+// treated as dangling) but reports no label.
+func (g *Graph) loadVertexIndex() (map[string]vertexMeta, error) {
+	index := make(map[string]vertexMeta)
+	err := g.vertices.ScannerE(nil, func(key []byte, value []byte) error {
+		label, _, derr := decodeVertexRecord(value)
+		if derr != nil {
+			g.corrupt.Add(1)
+			index[string(key)] = vertexMeta{}
+			return nil
+		}
+		index[string(key)] = vertexMeta{label: label, valid: true}
 		return nil
 	})
-	return ids, err
+	if err != nil {
+		return nil, err
+	}
+	return index, nil
+}
+
+// allVertexIDs enumerates every vertex id (isolated vertices included).
+func (g *Graph) allVertexIDs() ([]string, error) {
+	ids := make([]string, 0, len(g.vertexIndex))
+	for id := range g.vertexIndex {
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // markDirtyInvalidates: any runtime failure of the committed-edge invariant
@@ -82,16 +100,19 @@ func (g *Graph) Stats() map[string]int {
 // graph-side helpers used by traversal (call with coord held)
 
 func (g *Graph) hasVertexLocked(id string) bool {
-	return g.vertices.Exists([]byte(id))
+	_, ok := g.vertexIndex[id]
+	return ok
 }
 
 func (g *Graph) vertexLabelLocked(id string) (string, error) {
-	raw, err := g.vertices.Get([]byte(id))
-	if err != nil {
-		return "", err
+	meta, ok := g.vertexIndex[id]
+	if !ok {
+		return "", ErrVertexNotFound
 	}
-	label, _, err := decodeVertexRecord(raw)
-	return label, err
+	if !meta.valid {
+		return "", errForeignRecord
+	}
+	return meta.label, nil
 }
 
 // allEdgeElements decodes every edge into an element (props included).

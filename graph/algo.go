@@ -10,10 +10,10 @@ package graph
 // without outgoing edges (dangling) redistribute their rank uniformly.
 func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, error) {
 	if damping <= 0 || damping >= 1 {
-		damping = 0.85
+		damping = pageRankDamping
 	}
 	if iterations <= 0 {
-		iterations = 20
+		iterations = pageRankIterations
 	}
 	var result map[string]float64
 	err := g.runTraversal(func() error {
@@ -27,10 +27,13 @@ func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, e
 			return nil
 		}
 
+		// Out-degree counts edges; parallel edges are distinct, matching
+		// standard PageRank. (The previous dst-map representation counted a
+		// parallel pair once.)
 		degree := make(map[string]int, len(g.adj.out))
 		for id, lm := range g.adj.out {
-			for _, targets := range lm {
-				degree[id] += len(targets)
+			for _, list := range lm {
+				degree[id] += len(list)
 			}
 		}
 
@@ -51,9 +54,9 @@ func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, e
 					continue
 				}
 				share := damping * r / float64(d)
-				for _, targets := range g.adj.out[id] {
-					for dst := range targets {
-						next[dst] += share
+				for _, list := range g.adj.out[id] {
+					for _, e := range list {
+						next[e.dst] += share
 					}
 				}
 			}
@@ -87,7 +90,7 @@ func (g *Graph) BFS(start string, direction Direction) (map[string]int, error) {
 		if !g.hasVertexLocked(start) {
 			return ErrVertexNotFound
 		}
-		result = g.bfsLocked(start, direction, -1, true)
+		result = g.bfsLocked(start, direction, unboundedDepth, true)
 		return nil
 	})
 	return result, err
@@ -154,16 +157,16 @@ func (g *Graph) bfsLocked(start string, direction Direction, maxDepth int, inclu
 func (g *Graph) neighborsLocked(id string, direction Direction) []string {
 	var out []string
 	if lm, ok := g.adj.out[id]; ok && (direction == Outgoing || direction == BothDirections) {
-		for _, targets := range lm {
-			for dst := range targets {
-				out = append(out, dst)
+		for _, list := range lm {
+			for _, e := range list {
+				out = append(out, e.dst)
 			}
 		}
 	}
 	if lm, ok := g.adj.in[id]; ok && (direction == Incoming || direction == BothDirections) {
-		for _, sources := range lm {
-			for src := range sources {
-				out = append(out, src)
+		for _, list := range lm {
+			for _, e := range list {
+				out = append(out, e.dst)
 			}
 		}
 	}
@@ -203,9 +206,9 @@ func (g *Graph) Components() (map[string]string, error) {
 			}
 		}
 		for id, lm := range g.adj.out {
-			for _, targets := range lm {
-				for dst := range targets {
-					union(id, dst)
+			for _, list := range lm {
+				for _, e := range list {
+					union(id, e.dst)
 				}
 			}
 		}

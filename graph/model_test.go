@@ -181,61 +181,56 @@ func TestModelConcurrentGraphMutations(t *testing.T) {
 	}
 }
 
-// compareAdjacency checks the live adjacency against the model exactly.
+// adjKey canonicalises one directed edge for exact adjacency comparison.
+type adjKey struct {
+	from, label, to, id string
+}
+
+func flattenAdjacency(root map[string]map[string][]adjEdge, incoming bool) map[adjKey]int {
+	out := map[adjKey]int{}
+	for a, lm := range root {
+		for label, list := range lm {
+			for _, e := range list {
+				k := adjKey{from: a, label: label, to: e.dst, id: e.id}
+				if incoming {
+					k.from, k.to = e.dst, a
+				}
+				out[k]++
+			}
+		}
+	}
+	return out
+}
+
+// compareAdjacency checks the live adjacency against the model exactly,
+// including multiplicities and both directions.
 func compareAdjacency(g *Graph, m *adjacencyModel) error {
 	g.coord.RLock()
 	defer g.coord.RUnlock()
 
 	want := adjacencyFromModel(m)
-
-	for src, lm := range want.out {
-		for label, targets := range lm {
-			for dst, ids := range targets {
-				got, ok := g.adj.out[src]
-				if !ok {
-					return fmt.Errorf("missing out index for src %q", src)
-				}
-				t, ok := got[label]
-				if !ok {
-					return fmt.Errorf("missing out label %q for src %q", label, src)
-				}
-				for eid := range ids {
-					if _, ok := t[dst]; !ok {
-						return fmt.Errorf("missing out target %q for src %q", dst, src)
-					}
-					if _, ok := t[dst]; !ok {
-						return fmt.Errorf("edge %q missing", eid)
-					}
-				}
+	for _, dir := range []struct {
+		name      string
+		want, got map[string]map[string][]adjEdge
+		incoming  bool
+	}{
+		{"out", want.out, g.adj.out, false},
+		{"in", want.in, g.adj.in, true},
+	} {
+		w := flattenAdjacency(dir.want, dir.incoming)
+		got := flattenAdjacency(dir.got, dir.incoming)
+		if len(w) != len(got) {
+			return fmt.Errorf("%s adjacency size %d != %d", dir.name, len(got), len(w))
+		}
+		for k, n := range w {
+			if got[k] != n {
+				return fmt.Errorf("%s adjacency mismatch for %+v: got %d want %d", dir.name, k, got[k], n)
 			}
 		}
-	}
-	for src, lm := range g.adj.out {
-		for label, targets := range lm {
-			_ = label
-			for dst := range targets {
-				for id := range targets[dst] {
-					s, ok := m.edges[id]
-					if !ok {
-						return fmt.Errorf("stale adjacency edge %q", id)
-					}
-					if s[0] != src || s[1] != dst || s[2] != label {
-						return fmt.Errorf("adjacency edge %q wrong identity", id)
-					}
-				}
+		for k := range got {
+			if w[k] == 0 {
+				return fmt.Errorf("%s adjacency has stale edge %+v", dir.name, k)
 			}
-		}
-	}
-	for id, s := range m.edges {
-		lv, ok := g.adj.out[s[0]]
-		if !ok {
-			return fmt.Errorf("model edge %q missing from out adjacency", id)
-		}
-		if _, ok := lv[s[2]][s[1]]; !ok {
-			return fmt.Errorf("model edge %q missing in adjacency out", id)
-		}
-		if _, ok := g.adj.in[s[1]][s[2]][s[0]]; !ok {
-			return fmt.Errorf("model edge %q missing in adjacency in", id)
 		}
 	}
 	return nil

@@ -8,10 +8,6 @@ import (
 // Record envelopes are versioned and length-prefixed: identity is stored in
 // the record key (vertex ID / edge ID), metadata and properties in the
 // value. IDs and labels containing \x00 are unambiguous by construction.
-const (
-	recMagic   byte = 0x47 // 'G'
-	recVersion byte = 1
-)
 
 func appendField(dst []byte, field []byte) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(field)))

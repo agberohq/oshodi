@@ -50,5 +50,5 @@ func rawPropertyValue(props []byte, key string) ([]byte, bool, error) {
 
 // dedupKey builds an unambiguous composite key for value streams.
 func dedupKey(k string, v []byte) string {
-	return k + "|" + fmt.Sprint(len(k)) + ":" + string(v)
+	return k + dedupKeySep + fmt.Sprint(len(k)) + dedupLenSep + string(v)
 }

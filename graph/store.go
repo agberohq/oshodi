@@ -18,7 +18,11 @@ func (g *Graph) AddVertex(id, label string, props []byte) error {
 		raw, err := g.vertices.Get([]byte(id))
 		switch {
 		case err == oshodi.ErrKeyNotFound:
-			return g.vertices.Set([]byte(id), encodeVertexRecord(label, props))
+			if err := g.vertices.Set([]byte(id), encodeVertexRecord(label, props)); err != nil {
+				return err
+			}
+			g.vertexIndex[id] = vertexMeta{label: label, valid: true}
+			return nil
 		case err != nil:
 			return err
 		}
@@ -29,7 +33,11 @@ func (g *Graph) AddVertex(id, label string, props []byte) error {
 		if oldLabel != label {
 			return fmt.Errorf("vertex %q has label %q: %w", id, oldLabel, ErrLabelConflict)
 		}
-		return g.vertices.Set([]byte(id), encodeVertexRecord(oldLabel, props))
+		if err := g.vertices.Set([]byte(id), encodeVertexRecord(oldLabel, props)); err != nil {
+			return err
+		}
+		g.vertexIndex[id] = vertexMeta{label: oldLabel, valid: true}
+		return nil
 	})
 }
 
@@ -47,7 +55,11 @@ func (g *Graph) SetVertex(id string, props []byte) error {
 		if err != nil {
 			return err
 		}
-		return g.vertices.Set([]byte(id), encodeVertexRecord(label, props))
+		if err := g.vertices.Set([]byte(id), encodeVertexRecord(label, props)); err != nil {
+			return err
+		}
+		g.vertexIndex[id] = vertexMeta{label: label, valid: true}
+		return nil
 	})
 }
 
@@ -57,7 +69,7 @@ func (g *Graph) SetVertex(id string, props []byte) error {
 // vertex).
 func (g *Graph) RemoveVertex(id string) error {
 	return g.runMutation(func() error {
-		if !g.vertices.Exists([]byte(id)) {
+		if _, ok := g.vertexIndex[id]; !ok {
 			return ErrVertexNotFound
 		}
 		edges := g.collectIncidentLocked(id)
@@ -82,7 +94,11 @@ func (g *Graph) RemoveVertex(id string) error {
 				g.adj.remove(e.src, e.dst, e.label, e.id)
 			}
 		}
-		return g.vertices.Delete([]byte(id))
+		if err := g.vertices.Delete([]byte(id)); err != nil {
+			return err
+		}
+		delete(g.vertexIndex, id)
+		return nil
 	})
 }
 
@@ -195,7 +211,7 @@ func (g *Graph) RemoveEdge(id string) error {
 // helpers (call with coord held)
 
 func (g *Graph) mustExist(id string) error {
-	if !g.vertices.Exists([]byte(id)) {
+	if _, ok := g.vertexIndex[id]; !ok {
 		return fmt.Errorf("vertex %q: %w", id, ErrVertexNotFound)
 	}
 	return nil
@@ -228,20 +244,16 @@ func (g *Graph) loadEdgeLocked(id string) (Element, error) {
 func (g *Graph) collectIncidentLocked(id string) []edgeRef {
 	var refs []edgeRef
 	if lm, ok := g.adj.out[id]; ok {
-		for label, targets := range lm {
-			for dst, ids := range targets {
-				for eid := range ids {
-					refs = append(refs, edgeRef{src: id, dst: dst, label: label, id: eid})
-				}
+		for label, list := range lm {
+			for _, e := range list {
+				refs = append(refs, edgeRef{src: id, dst: e.dst, label: label, id: e.id})
 			}
 		}
 	}
 	if lm, ok := g.adj.in[id]; ok {
-		for label, sources := range lm {
-			for src, ids := range sources {
-				for eid := range ids {
-					refs = append(refs, edgeRef{src: src, dst: id, label: label, id: eid})
-				}
+		for label, list := range lm {
+			for _, e := range list {
+				refs = append(refs, edgeRef{src: e.dst, dst: id, label: label, id: e.id})
 			}
 		}
 	}
@@ -275,6 +287,7 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 		// Validate endpoints once per unique vertex and identity map.
 		seenVertex := map[string]struct{}{}
 		seenID := map[string]struct{}{}
+		existing := make([]bool, len(specs))
 		entries := make([]oshodi.KV, 0, len(specs))
 		for i := range specs {
 			sp := specs[i]
@@ -283,8 +296,29 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 			}
 			if sp.ID == "" {
 				sp.ID = newULID()
-			} else if _, dup := seenID[sp.ID]; dup {
-				return fmt.Errorf("edge id %q duplicated within batch: %w", sp.ID, ErrEdgeExists)
+			} else {
+				if _, dup := seenID[sp.ID]; dup {
+					return fmt.Errorf("edge id %q duplicated within batch: %w", sp.ID, ErrEdgeExists)
+				}
+				// An explicit id may already exist: allow a property upsert
+				// only when its identity is unchanged, and leave the
+				// adjacency entry alone (it already points at this edge).
+				raw, err := g.edges.Get([]byte(sp.ID))
+				switch {
+				case err == nil:
+					os, od, oldLabel, _, derr := decodeEdgeRecord(raw)
+					if derr != nil {
+						return derr
+					}
+					if os != sp.Src || od != sp.Dst || oldLabel != sp.Label {
+						return fmt.Errorf("edge %q exists as (%q)-[%s]->(%q): %w", sp.ID, os, oldLabel, od, ErrEdgeExists)
+					}
+					existing[i] = true
+				case err == oshodi.ErrKeyNotFound:
+					// new edge
+				default:
+					return err
+				}
 			}
 			seenID[sp.ID] = struct{}{}
 			for _, end := range []string{sp.Src, sp.Dst} {
@@ -292,7 +326,7 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 					continue
 				}
 				seenVertex[end] = struct{}{}
-				if !g.vertices.Exists([]byte(end)) {
+				if _, ok := g.vertexIndex[end]; !ok {
 					return fmt.Errorf("vertex %q: %w", end, ErrVertexNotFound)
 				}
 			}
@@ -309,6 +343,9 @@ func (g *Graph) AddEdges(specs []EdgeSpec) ([]string, error) {
 			return err
 		}
 		for i := range specs {
+			if existing[i] {
+				continue
+			}
 			g.adj.add(specs[i].Src, specs[i].Dst, specs[i].Label, ids[i])
 		}
 		return nil
@@ -359,6 +396,15 @@ func (g *Graph) AddVertices(specs []VertexSpec) error {
 				entries = append(entries, oshodi.KV{Key: []byte(sp.ID), Value: encodeVertexRecord(oldLabel, sp.Props)})
 			}
 		}
-		return g.vertices.BatchSet(entries)
+		if err := g.vertices.BatchSet(entries); err != nil {
+			// A partially applied batch leaves the label index incomplete;
+			// fail closed rather than reject edges for existing vertices.
+			g.markDirty()
+			return err
+		}
+		for _, sp := range specs {
+			g.vertexIndex[sp.ID] = vertexMeta{label: sp.Label, valid: true}
+		}
+		return nil
 	})
 }

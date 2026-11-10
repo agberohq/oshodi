@@ -9,35 +9,43 @@ import (
 	oshodi "github.com/agberohq/oshodi"
 )
 
-// Traversal is a chainable graph traversal. Stages materialize element
-// sets as they are called (each stage runs under the graph's shared read
-// lock); subsequent stages see the current set. Results are **live,
+// Traversal is a chainable graph traversal. Results are **live,
 // weakly-consistent views**: a mutation may occur between two stages and be
-// observed by the later one. Any error surfaces from the terminal
-// operation.
+// observed by the later one. Any error surfaces from the terminal operation.
+//
+// Vertex-only stages (V with no ids, HasLabel, Skip, Limit) are fused into a
+// deferred plan and evaluated when a terminal or a non-fusable stage needs
+// the concrete set. This lets Count/IDs and Limit-terminated projections
+// avoid materialising every vertex. Other stages materialise and run
+// immediately under the graph's shared read lock.
 type Traversal struct {
 	g     *Graph
 	elems []Element
 	err   error
+
+	// Deferred vertex-only source: V() with no ids does not build Elements
+	// until a stage or terminal needs them. HasLabel and Limit extend this
+	// plan, which lets Count/IDs and Limit-terminated projections avoid
+	// materializing the whole vertex set.
+	lazyAll    bool
+	lazyLabels []string
+	lazySkip   int
+	lazyLimit  int
 }
 
 // V starts a traversal from specific vertices, or from every vertex when no
 // ids are given.
 func (g *Graph) V(ids ...string) *Traversal {
-	t := &Traversal{g: g}
+	t := &Traversal{g: g, lazyLimit: -1}
 	t.step(func() error {
-		out := make([]Element, 0, len(ids))
 		if len(ids) == 0 {
-			all, err := g.allVertexIDs()
-			if err != nil {
-				return err
-			}
-			for _, id := range all {
-				out = append(out, Element{Kind: VertexElement, ID: id})
-			}
-			t.elems = out
+			// Defer building Elements until a stage or terminal needs the
+			// concrete set. Count/IDs and Limit-terminated projections then
+			// avoid a full 20k-element materialization.
+			t.lazyAll = true
 			return nil
 		}
+		out := make([]Element, 0, len(ids))
 		for _, id := range ids {
 			if id == "" {
 				return ErrInvalidIdentity
@@ -55,7 +63,7 @@ func (g *Graph) V(ids ...string) *Traversal {
 
 // E starts a traversal from specific edges, or from every edge.
 func (g *Graph) E(ids ...string) *Traversal {
-	t := &Traversal{g: g}
+	t := &Traversal{g: g, lazyLimit: -1}
 	t.step(func() error {
 		var out []Element
 		if len(ids) == 0 {
@@ -119,6 +127,11 @@ func (t *Traversal) BothE(labels ...string) *Traversal {
 // envelope, no property decode).
 func (t *Traversal) HasLabel(label string) *Traversal {
 	t.step(func() error {
+		if t.lazyAll && t.lazyLimit < 0 {
+			t.lazyLabels = append(t.lazyLabels, label)
+			return nil
+		}
+		t.materialize()
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
 			if t.elems[i].Kind != VertexElement {
@@ -146,6 +159,7 @@ func (t *Traversal) HasLabel(label string) *Traversal {
 // adjacency index).
 func (t *Traversal) HasEdgeLabel(label string) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
 			if t.elems[i].Kind == EdgeElement && t.elems[i].EdgeLabel == label {
@@ -163,6 +177,7 @@ func (t *Traversal) HasEdgeLabel(label string) *Traversal {
 // stored number match regardless of Go type.
 func (t *Traversal) Has(key string, value any) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		out := make([]Element, 0, len(t.elems))
 		expected, err := jsonMarshal(value)
 		if err != nil {
@@ -205,6 +220,7 @@ func (t *Traversal) Has(key string, value any) *Traversal {
 // that property contribute nothing.
 func (t *Traversal) Values(key string) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		var out []Element
 		for i := range t.elems {
 			props, _, err := t.elementProps(t.elems[i])
@@ -233,6 +249,7 @@ func (t *Traversal) Values(key string) *Traversal {
 // Keys yields one value element per property key of each vertex/edge.
 func (t *Traversal) Keys() *Traversal {
 	t.step(func() error {
+		t.materialize()
 		var out []Element
 		for i := range t.elems {
 			props, ok, err := t.elementProps(t.elems[i])
@@ -264,6 +281,7 @@ func (t *Traversal) Keys() *Traversal {
 // It is pure: storage is never touched, and a nil result keeps the id.
 func (t *Traversal) MutateID(fn func(id string) string) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		for i := range t.elems {
 			if next := fn(t.elems[i].ID); next != "" {
 				t.elems[i].ID = next
@@ -280,6 +298,7 @@ func (t *Traversal) MutateID(fn func(id string) string) *Traversal {
 // use the write API for that.
 func (t *Traversal) Mutate(fn func(Element) (Element, error)) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
 			el := t.elems[i]
@@ -305,6 +324,7 @@ func (t *Traversal) Mutate(fn func(Element) (Element, error)) *Traversal {
 // Filter keeps only elements the callback approves.
 func (t *Traversal) Filter(fn func(Element) bool) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
 			if fn(t.elems[i]) {
@@ -320,6 +340,7 @@ func (t *Traversal) Filter(fn func(Element) bool) *Traversal {
 // Dedup removes repeated ids from the stream.
 func (t *Traversal) Dedup() *Traversal {
 	t.step(func() error {
+		t.materialize()
 		seen := make(map[string]struct{}, len(t.elems))
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
@@ -349,6 +370,11 @@ func (t *Traversal) Limit(n int) *Traversal {
 		if n < 0 {
 			n = 0
 		}
+		if t.lazyAll && t.lazyLimit < 0 {
+			t.lazyLimit = n
+			return nil
+		}
+		t.materialize()
 		if n < len(t.elems) {
 			t.elems = t.elems[:n]
 		}
@@ -360,6 +386,14 @@ func (t *Traversal) Limit(n int) *Traversal {
 // Skip drops the first n elements.
 func (t *Traversal) Skip(n int) *Traversal {
 	t.step(func() error {
+		if n <= 0 {
+			return nil
+		}
+		if t.lazyAll && t.lazySkip == 0 && t.lazyLimit < 0 && len(t.lazyLabels) == 0 {
+			t.lazySkip = n
+			return nil
+		}
+		t.materialize()
 		if n > 0 {
 			if n > len(t.elems) {
 				n = len(t.elems)
@@ -374,6 +408,7 @@ func (t *Traversal) Skip(n int) *Traversal {
 // Shuffle randomizes the current stream order with an explicit source.
 func (t *Traversal) Shuffle(rng *rand.Rand) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		if rng != nil {
 			rng.Shuffle(len(t.elems), func(i, j int) {
 				t.elems[i], t.elems[j] = t.elems[j], t.elems[i]
@@ -388,6 +423,7 @@ func (t *Traversal) Shuffle(rng *rand.Rand) *Traversal {
 // streams), giving predictable pagination-style behavior.
 func (t *Traversal) OrderByID() *Traversal {
 	t.step(func() error {
+		t.materialize()
 		sort.SliceStable(t.elems, func(i, j int) bool {
 			if t.elems[i].Kind != t.elems[j].Kind {
 				return t.elems[i].Kind < t.elems[j].Kind
@@ -415,6 +451,10 @@ func (t *Traversal) ToList() ([]Element, error) {
 	if t.g.closing {
 		return nil, ErrGraphClosed
 	}
+	t.materialize()
+	if t.err != nil {
+		return nil, t.err
+	}
 	out := make([]Element, 0, len(t.elems))
 	for i := range t.elems {
 		el := t.elems[i]
@@ -437,6 +477,9 @@ func (t *Traversal) IDs() ([]string, error) {
 	if t.g.closing {
 		return nil, ErrGraphClosed
 	}
+	if t.lazyAll {
+		return t.lazyIDs()
+	}
 	out := make([]string, 0, len(t.elems))
 	for i := range t.elems {
 		if t.elems[i].Kind == ValueElement {
@@ -458,6 +501,9 @@ func (t *Traversal) Count() (int, error) {
 	if t.g.closing {
 		return 0, ErrGraphClosed
 	}
+	if t.lazyAll {
+		return t.countLazy()
+	}
 	return len(t.elems), nil
 }
 
@@ -477,6 +523,10 @@ func (t *Traversal) Iterate(fn func(Element) error) error {
 	if t.g.closing {
 		return ErrGraphClosed
 	}
+	t.materialize()
+	if t.err != nil {
+		return t.err
+	}
 	for i := range t.elems {
 		el := t.elems[i]
 		props, _, err := t.elementProps(el)
@@ -491,6 +541,127 @@ func (t *Traversal) Iterate(fn func(Element) error) error {
 }
 
 // internals
+
+func matchesAllLabels(label string, wanted []string) bool {
+	for _, w := range wanted {
+		if w != label {
+			return false
+		}
+	}
+	return true
+}
+
+// materialize expands a deferred vertex-only source into Elements.
+func (t *Traversal) materialize() {
+	if !t.lazyAll {
+		return
+	}
+	if t.g.dirty.Load() {
+		t.err = ErrIndexDirty
+		return
+	}
+	filter := len(t.lazyLabels) > 0
+	capHint := len(t.g.vertexIndex) - t.lazySkip
+	if capHint < 0 {
+		capHint = 0
+	}
+	if t.lazyLimit >= 0 && t.lazyLimit < capHint {
+		capHint = t.lazyLimit
+	}
+	out := make([]Element, 0, capHint)
+	skipped := 0
+	for id, meta := range t.g.vertexIndex {
+		if skipped < t.lazySkip {
+			skipped++
+			continue
+		}
+		if t.lazyLimit >= 0 && len(out) >= t.lazyLimit {
+			break
+		}
+		if filter {
+			if !meta.valid {
+				t.err = errForeignRecord
+				break
+			}
+			if !matchesAllLabels(meta.label, t.lazyLabels) {
+				continue
+			}
+		}
+		el := Element{Kind: VertexElement, ID: id}
+		if filter {
+			el.Label = meta.label
+		}
+		out = append(out, el)
+	}
+	t.elems = out
+	t.lazyAll = false
+	t.lazyLabels = nil
+	t.lazySkip = 0
+	t.lazyLimit = -1
+}
+
+func (t *Traversal) countLazy() (int, error) {
+	if t.g.dirty.Load() {
+		return 0, ErrIndexDirty
+	}
+	filter := len(t.lazyLabels) > 0
+	n := 0
+	skipped := 0
+	for _, meta := range t.g.vertexIndex {
+		if skipped < t.lazySkip {
+			skipped++
+			continue
+		}
+		if t.lazyLimit >= 0 && n >= t.lazyLimit {
+			break
+		}
+		if filter {
+			if !meta.valid {
+				return 0, errForeignRecord
+			}
+			if !matchesAllLabels(meta.label, t.lazyLabels) {
+				continue
+			}
+		}
+		n++
+	}
+	return n, nil
+}
+
+func (t *Traversal) lazyIDs() ([]string, error) {
+	if t.g.dirty.Load() {
+		return nil, ErrIndexDirty
+	}
+	filter := len(t.lazyLabels) > 0
+	capHint := len(t.g.vertexIndex) - t.lazySkip
+	if capHint < 0 {
+		capHint = 0
+	}
+	if t.lazyLimit >= 0 && t.lazyLimit < capHint {
+		capHint = t.lazyLimit
+	}
+	out := make([]string, 0, capHint)
+	skipped := 0
+	for id, meta := range t.g.vertexIndex {
+		if skipped < t.lazySkip {
+			skipped++
+			continue
+		}
+		if t.lazyLimit >= 0 && len(out) >= t.lazyLimit {
+			break
+		}
+		if filter {
+			if !meta.valid {
+				return nil, errForeignRecord
+			}
+			if !matchesAllLabels(meta.label, t.lazyLabels) {
+				continue
+			}
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
 
 // step runs a stage body under the graph's shared read lock. Stages execute
 // immediately: the set for each stage is materialized as the chain is
@@ -569,6 +740,7 @@ func labelSet(labels []string) map[string]struct{} {
 
 func (t *Traversal) traverseVertices(dir direction, labels ...string) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		wanted := labelSet(labels)
 		seen := make(map[string]struct{})
 		out := make([]Element, 0, len(t.elems))
@@ -578,31 +750,31 @@ func (t *Traversal) traverseVertices(dir direction, labels ...string) *Traversal
 			}
 			id := t.elems[i].ID
 			if lm, ok := t.g.adj.out[id]; ok && (dir == directionOut || dir == directionBoth) {
-				for label, targets := range lm {
+				for label, list := range lm {
 					if wanted != nil {
 						if _, ok := wanted[label]; !ok {
 							continue
 						}
 					}
-					for dst := range targets {
-						if _, ok := seen[dst]; !ok {
-							seen[dst] = struct{}{}
-							out = append(out, Element{Kind: VertexElement, ID: dst})
+					for _, e := range list {
+						if _, ok := seen[e.dst]; !ok {
+							seen[e.dst] = struct{}{}
+							out = append(out, Element{Kind: VertexElement, ID: e.dst})
 						}
 					}
 				}
 			}
 			if lm, ok := t.g.adj.in[id]; ok && (dir == directionIn || dir == directionBoth) {
-				for label, sources := range lm {
+				for label, list := range lm {
 					if wanted != nil {
 						if _, ok := wanted[label]; !ok {
 							continue
 						}
 					}
-					for src := range sources {
-						if _, ok := seen[src]; !ok {
-							seen[src] = struct{}{}
-							out = append(out, Element{Kind: VertexElement, ID: src})
+					for _, e := range list {
+						if _, ok := seen[e.dst]; !ok {
+							seen[e.dst] = struct{}{}
+							out = append(out, Element{Kind: VertexElement, ID: e.dst})
 						}
 					}
 				}
@@ -616,6 +788,7 @@ func (t *Traversal) traverseVertices(dir direction, labels ...string) *Traversal
 
 func (t *Traversal) traverseEdges(dir direction, labels ...string) *Traversal {
 	t.step(func() error {
+		t.materialize()
 		wanted := labelSet(labels)
 		out := make([]Element, 0, len(t.elems))
 		for i := range t.elems {
@@ -624,36 +797,32 @@ func (t *Traversal) traverseEdges(dir direction, labels ...string) *Traversal {
 			}
 			id := t.elems[i].ID
 			if lm, ok := t.g.adj.out[id]; ok && (dir == directionOut || dir == directionBoth) {
-				for label, targets := range lm {
+				for label, list := range lm {
 					if wanted != nil {
 						if _, ok := wanted[label]; !ok {
 							continue
 						}
 					}
-					for dst, ids := range targets {
-						for eid := range ids {
-							out = append(out, Element{
-								Kind: EdgeElement, ID: eid,
-								Src: id, Dst: dst, EdgeLabel: label,
-							})
-						}
+					for _, e := range list {
+						out = append(out, Element{
+							Kind: EdgeElement, ID: e.id,
+							Src: id, Dst: e.dst, EdgeLabel: label,
+						})
 					}
 				}
 			}
 			if lm, ok := t.g.adj.in[id]; ok && (dir == directionIn || dir == directionBoth) {
-				for label, sources := range lm {
+				for label, list := range lm {
 					if wanted != nil {
 						if _, ok := wanted[label]; !ok {
 							continue
 						}
 					}
-					for src, ids := range sources {
-						for eid := range ids {
-							out = append(out, Element{
-								Kind: EdgeElement, ID: eid,
-								Src: src, Dst: id, EdgeLabel: label,
-							})
-						}
+					for _, e := range list {
+						out = append(out, Element{
+							Kind: EdgeElement, ID: e.id,
+							Src: e.dst, Dst: id, EdgeLabel: label,
+						})
 					}
 				}
 			}
