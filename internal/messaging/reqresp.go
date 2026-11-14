@@ -46,8 +46,13 @@ func NewReqResp(timeout time.Duration) *ReqResp {
 	}
 }
 
-// Register binds name → handler.
+// Register binds name → handler. A nil handler removes any existing
+// registration instead of storing a value that would panic on call.
 func (r *ReqResp) Register(name string, fn HandlerFunc) {
+	if fn == nil {
+		r.handlers.Delete(name)
+		return
+	}
 	r.handlers.Set(name, fn)
 }
 
@@ -84,7 +89,7 @@ func runHandler(fn HandlerFunc, payload []byte, ch chan callResult) {
 // the goroutine and channel round trip.
 func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 	fn, ok := r.handlers.Get(name)
-	if !ok {
+	if !ok || fn == nil {
 		return nil, fmt.Errorf("no handler registered for %q", name)
 	}
 
@@ -124,7 +129,7 @@ func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 // CallDirect invokes the handler in the current goroutine.
 func (r *ReqResp) CallDirect(name string, payload []byte) ([]byte, error) {
 	fn, ok := r.handlers.Get(name)
-	if !ok {
+	if !ok || fn == nil {
 		return nil, fmt.Errorf("no handler registered for %q", name)
 	}
 	return fn(payload)

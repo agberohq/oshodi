@@ -39,7 +39,9 @@ func (j *pubsubJob) Do() error {
 		pubsubJobPool.Put(j)
 	}()
 
-	j.fn(j.payload)
+	if j.fn != nil {
+		j.fn(j.payload)
+	}
 	return nil
 }
 
