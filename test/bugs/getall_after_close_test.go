@@ -15,7 +15,7 @@ func TestGetAllAndScanAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	if err := b.Set([]byte("k"), []byte("v")); err != nil {
 		t.Fatal(err)
 	}

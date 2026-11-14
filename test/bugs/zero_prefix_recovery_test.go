@@ -22,7 +22,7 @@ func TestCatalogueSurvivesPreallocatedZeroPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open source: %v", err)
 	}
-	b := db.Bucket("songs")
+	b := mustBucket(t, db, "songs")
 	for k, v := range map[string]string{
 		"testing":         `{"title":"Testing"}`,
 		"june-express-v2": `{"title":"June Express V2"}`,
@@ -51,7 +51,7 @@ func TestCatalogueSurvivesPreallocatedZeroPrefix(t *testing.T) {
 	}
 	defer db.Close()
 
-	b = db.Bucket("songs")
+	b = mustBucket(t, db, "songs")
 	if v, err := b.Get([]byte("testing")); err != nil || len(v) == 0 {
 		t.Fatalf("get testing: %v %q", err, v)
 	}
@@ -75,7 +75,7 @@ func TestCatalogueSurvivesPreallocatedZeroPrefix(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer db.Close()
-	if got := count(db.Bucket("songs")); got != 3 {
+	if got := count(mustBucket(t, db, "songs")); got != 3 {
 		t.Fatalf("records after second restart = %d, want 3", got)
 	}
 }

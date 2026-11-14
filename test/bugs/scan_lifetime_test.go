@@ -20,7 +20,7 @@ func TestScanRetainsSlicesWhileScannerReuses(t *testing.T) {
 	}
 	defer db.Close()
 
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	const n = 128
 	want := make(map[string]string, n)
 	for i := 0; i < n; i++ {

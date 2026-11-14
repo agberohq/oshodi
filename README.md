@@ -86,15 +86,19 @@ db.Publish("events", []byte("hello world"))
 ## Bucket-Scoped Operations
 
 ```go
-bucket := db.Bucket("mybucket")
+bucket, err := db.Bucket("mybucket")
+if err != nil {
+    log.Fatal(err)
+}
 
-// Register a handler
-bucket.RegisterHandler("echo", func(req []byte) ([]byte, error) {
+// Register a handler; its context is cancelled when the caller
+// stops waiting (timeout or cancellation)
+bucket.RegisterHandler("echo", func(ctx context.Context, req []byte) ([]byte, error) {
     return req, nil
 })
 
 // Call the handler
-response, _ := bucket.Call("echo", []byte("ping"))
+response, _ := bucket.Call(context.Background(), "echo", []byte("ping"))
 ```
 
 ## Vector Search
