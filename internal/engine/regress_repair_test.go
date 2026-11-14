@@ -76,7 +76,10 @@ func TestCoalescedSetVisibleToOrderedScan(t *testing.T) {
 	}
 	defer db.Close()
 
-	b := db.GetBucket("b")
+	b, err := db.GetBucket("b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Prime the ordered snapshot so visibility needs an invalidation, not a
 	// fresh build.
 	if err := b.ScanPrefix([]byte(""), func(key, value []byte) bool { return true }); err != nil {

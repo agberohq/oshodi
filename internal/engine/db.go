@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +24,16 @@ import (
 )
 
 var (
-	ErrKeyNotFound   = errors.New("oshodi: key not found")
-	ErrKeyEmpty      = errors.New("oshodi: key cannot be empty")
-	ErrBufferFull    = errors.New("oshodi: write buffer full")
-	ErrDBClosed      = errors.New("oshodi: database closed")
-	ErrKeyTooLarge   = errors.New("oshodi: key exceeds configured maximum size")
-	ErrValueTooLarge = errors.New("oshodi: value exceeds configured maximum size")
+	ErrKeyNotFound = errors.New("oshodi: key not found")
+	ErrKeyEmpty    = errors.New("oshodi: key cannot be empty")
+	ErrBufferFull  = errors.New("oshodi: write buffer full")
+	ErrDBClosed    = errors.New("oshodi: database closed")
+
+	// ErrInvalidBucketName rejects bucket names containing NUL bytes, which
+	// would collide with other buckets' keys.
+	ErrInvalidBucketName = errors.New("oshodi: bucket name must not contain NUL bytes")
+	ErrKeyTooLarge       = errors.New("oshodi: key exceeds configured maximum size")
+	ErrValueTooLarge     = errors.New("oshodi: value exceeds configured maximum size")
 )
 
 type DBStats struct {
@@ -1254,9 +1259,10 @@ func (db *DB) EstimatedKeyCount() uint64 {
 }
 
 // RegisterHandler binds a name to a request‑response handler.
-// The handler will be invoked when Call is used with the same name.
-func (db *DB) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
-	db.handlers.Register(name, messaging.HandlerFunc(fn))
+// The handler will be invoked when Call is used with the same name; its
+// context is cancelled when the caller stops waiting.
+func (db *DB) RegisterHandler(name string, fn messaging.HandlerFunc) {
+	db.handlers.Register(name, fn)
 }
 
 // UnregisterHandler removes a previously registered handler.
@@ -1266,14 +1272,14 @@ func (db *DB) UnregisterHandler(name string) {
 
 // Call invokes a registered handler with a timeout.
 // It returns the handler's response or an error on timeout.
-func (db *DB) Call(name string, payload []byte) ([]byte, error) {
-	return db.handlers.Call(name, payload)
+func (db *DB) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return db.handlers.Call(ctx, name, payload)
 }
 
 // CallDirect invokes a registered handler without timeout protection.
 // It runs the handler in the caller's goroutine.
-func (db *DB) CallDirect(name string, payload []byte) ([]byte, error) {
-	return db.handlers.CallDirect(name, payload)
+func (db *DB) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return db.handlers.CallDirect(ctx, name, payload)
 }
 
 // Subscribe registers a callback for a channel.
@@ -1310,8 +1316,14 @@ func (db *DB) GetAllSubscriptionIDs(channel string) []int64 {
 }
 
 // GetBucket returns a namespaced bucket handle.
-// Buckets isolate keys and provide their own set of methods.
-func (db *DB) GetBucket(name string) *Bucket {
+// Buckets isolate keys and provide their own set of methods. Bucket names
+// must not contain NUL bytes: the prefix is name-terminated-by-NUL, and a
+// NUL inside the name would make keys from two different buckets collide
+// byte-for-byte.
+func (db *DB) GetBucket(name string) (*Bucket, error) {
+	if strings.IndexByte(name, 0) >= 0 {
+		return nil, ErrInvalidBucketName
+	}
 	prefix := make([]byte, 0, len(name)+1)
 	if name != "" {
 		prefix = append(prefix, name...)
@@ -1321,7 +1333,7 @@ func (db *DB) GetBucket(name string) *Bucket {
 		name:   name,
 		prefix: prefix,
 		db:     db,
-	}
+	}, nil
 }
 
 // Close shuts down the database gracefully.

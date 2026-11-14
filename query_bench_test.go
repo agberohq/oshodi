@@ -13,7 +13,7 @@ func benchOrderedBucket(b *testing.B, n int) *Bucket {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = db.Close() })
-	bk := db.Bucket("b")
+	bk := mustBucket(b, db, "b")
 	entries := make([]KV, 0, 1000)
 	for i := 0; i < n; i++ {
 		entries = append(entries, KV{
@@ -117,7 +117,7 @@ func BenchmarkOrderedScanAfterOtherBucketWrite(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer db.Close()
-	a, other := db.Bucket("a"), db.Bucket("o")
+	a, other := mustBucket(b, db, "a"), mustBucket(b, db, "o")
 	fillBucket(b, a, 250000)
 	fillBucket(b, other, 250000)
 

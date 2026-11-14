@@ -6,12 +6,17 @@ import (
 	"sync/atomic"
 
 	"github.com/agberohq/oshodi/internal/engine"
+	"github.com/agberohq/oshodi/internal/messaging"
 )
 
 var (
 	ErrClosed      = errors.New("oshodi: database closed")
 	ErrKeyEmpty    = errors.New("oshodi: key cannot be empty")
 	ErrKeyNotFound = engine.ErrKeyNotFound
+
+	// ErrInvalidBucketName rejects bucket names containing NUL bytes, which
+	// would make keys from two different buckets collide byte-for-byte.
+	ErrInvalidBucketName = engine.ErrInvalidBucketName
 )
 
 // DB is the main database handle
@@ -89,12 +94,17 @@ func (db *DB) Close() error {
 	return db.inner.Close()
 }
 
-// Bucket returns a handle to a named bucket
-func (db *DB) Bucket(name string) *Bucket {
-	return &Bucket{
-		inner: db.inner.GetBucket(name),
-		db:    db,
+// Bucket returns a handle to a named bucket. Names must not contain NUL
+// bytes, which would make keys from two different buckets collide.
+func (db *DB) Bucket(name string) (*Bucket, error) {
+	inner, err := db.inner.GetBucket(name)
+	if err != nil {
+		return nil, err
 	}
+	return &Bucket{
+		inner: inner,
+		db:    db,
+	}, nil
 }
 
 // Flush forces all pending writes to disk
@@ -288,8 +298,8 @@ func (db *DB) MapReduce(
 }
 
 // RegisterHandler registers a request-response handler
-func (db *DB) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
-	db.inner.RegisterHandler(name, fn)
+func (db *DB) RegisterHandler(name string, fn func(ctx context.Context, req []byte) ([]byte, error)) {
+	db.inner.RegisterHandler(name, messaging.HandlerFunc(fn))
 }
 
 // UnregisterHandler removes a request-response handler
@@ -298,13 +308,13 @@ func (db *DB) UnregisterHandler(name string) {
 }
 
 // Call invokes a handler with timeout protection
-func (db *DB) Call(name string, payload []byte) ([]byte, error) {
-	return db.inner.Call(name, payload)
+func (db *DB) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return db.inner.Call(ctx, name, payload)
 }
 
 // CallDirect invokes a handler in current goroutine
-func (db *DB) CallDirect(name string, payload []byte) ([]byte, error) {
-	return db.inner.CallDirect(name, payload)
+func (db *DB) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return db.inner.CallDirect(ctx, name, payload)
 }
 
 // Subscribe registers a callback for a channel
@@ -600,8 +610,8 @@ func (b *Bucket) SubscribeWithID(channel string, fn func([]byte)) (int64, func()
 }
 
 // RegisterHandler registers a bucket-scoped handler
-func (b *Bucket) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
-	b.inner.RegisterHandler(name, fn)
+func (b *Bucket) RegisterHandler(name string, fn func(ctx context.Context, req []byte) ([]byte, error)) {
+	b.inner.RegisterHandler(name, messaging.HandlerFunc(fn))
 }
 
 // UnregisterHandler removes a bucket-scoped handler
@@ -610,13 +620,13 @@ func (b *Bucket) UnregisterHandler(name string) {
 }
 
 // Call invokes a bucket-scoped handler
-func (b *Bucket) Call(name string, payload []byte) ([]byte, error) {
-	return b.inner.Call(name, payload)
+func (b *Bucket) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return b.inner.Call(ctx, name, payload)
 }
 
 // CallDirect invokes a bucket-scoped handler in current goroutine
-func (b *Bucket) CallDirect(name string, payload []byte) ([]byte, error) {
-	return b.inner.CallDirect(name, payload)
+func (b *Bucket) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return b.inner.CallDirect(ctx, name, payload)
 }
 
 // UnsubscribeAll removes all subscribers from a channel

@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+// mustBucket returns a bucket handle, failing the test on an invalid name.
+func mustBucket(t testing.TB, db *DB, name string) *Bucket {
+	t.Helper()
+	b, err := db.Bucket(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestOpenAndClose(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -65,7 +75,7 @@ func TestBucketBasicOperations(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	// Test Set and Get
 	key := []byte("key1")
@@ -112,7 +122,7 @@ func TestBucketEmptyKey(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	err = bucket.Set([]byte{}, []byte("value"))
 	if err == nil {
@@ -135,7 +145,7 @@ func TestBucketGetAll(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	testData := map[string]string{
 		"key1": "value1",
@@ -180,7 +190,7 @@ func TestBucketScan(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	testData := map[string]string{
 		"key1": "value1",
@@ -227,8 +237,8 @@ func TestMultipleBuckets(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket1 := db.Bucket("bucket1")
-	bucket2 := db.Bucket("bucket2")
+	bucket1 := mustBucket(t, db, "bucket1")
+	bucket2 := mustBucket(t, db, "bucket2")
 
 	err = bucket1.Set([]byte("key"), []byte("value1"))
 	if err != nil {
@@ -267,7 +277,7 @@ func TestConcurrentOperations(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 	var wg sync.WaitGroup
 	numGoroutines := 100
 	numOps := 100
@@ -314,7 +324,7 @@ func TestStats(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	// Add some data
 	for i := 0; i < 100; i++ {
@@ -349,7 +359,7 @@ func TestSize(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	initialSize := db.Size()
 
@@ -376,7 +386,7 @@ func TestEstimatedKeyCount(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	// Add some unique keys
 	for i := 0; i < 1000; i++ {
@@ -410,7 +420,7 @@ func TestGetKeyFrequency(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	key := []byte("frequent-key")
 	value := []byte("value")
@@ -438,7 +448,7 @@ func TestFlush(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	for i := 0; i < 100; i++ {
 		key := []byte("key" + string(rune(i)))
@@ -465,7 +475,7 @@ func TestCompact(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	// Add some data
 	for i := 0; i < 100; i++ {
@@ -511,7 +521,7 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("failed to open database: %v", err)
 	}
 
-	bucket1 := db1.Bucket("test")
+	bucket1 := mustBucket(t, db1, "test")
 	testData := map[string]string{
 		"persist1": "value1",
 		"persist2": "value2",
@@ -539,7 +549,7 @@ func TestPersistence(t *testing.T) {
 	}
 	defer db2.Close()
 
-	bucket2 := db2.Bucket("test")
+	bucket2 := mustBucket(t, db2, "test")
 
 	for k, expected := range testData {
 		got, err := bucket2.Get([]byte(k))
@@ -562,7 +572,7 @@ func TestErrorCases(t *testing.T) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(t, db, "test")
 
 	// Test Get non-existent key
 	_, err = bucket.Get([]byte("nonexistent"))
@@ -587,7 +597,7 @@ func BenchmarkSet(b *testing.B) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(b, db, "test")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -609,7 +619,7 @@ func BenchmarkGet(b *testing.B) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(b, db, "test")
 
 	// Pre-populate data
 	for i := 0; i < 10000; i++ {
@@ -639,7 +649,7 @@ func BenchmarkConcurrentSet(b *testing.B) {
 	}
 	defer db.Close()
 
-	bucket := db.Bucket("test")
+	bucket := mustBucket(b, db, "test")
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -675,7 +685,7 @@ func TestBucketScanner(t *testing.T) {
 	}
 	defer db.Close()
 
-	b := db.Bucket("s")
+	b := mustBucket(t, db, "s")
 	want := map[string]string{
 		"alpha":   "one",
 		"beta":    "two",
@@ -713,7 +723,7 @@ func TestBucketScanner(t *testing.T) {
 	}
 
 	// An empty bucket must scan cleanly.
-	if err := db.Bucket("empty").Scanner(func(k, v []byte) bool {
+	if err := mustBucket(t, db, "empty").Scanner(func(k, v []byte) bool {
 		t.Fatal("callback ran for empty bucket")
 		return false
 	}); err != nil {
@@ -732,7 +742,7 @@ func TestBucketGetter(t *testing.T) {
 	}
 	defer db.Close()
 
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	if err := b.Set([]byte("alpha"), []byte("one")); err != nil {
 		t.Fatalf("set: %v", err)
 	}
@@ -768,7 +778,7 @@ func TestBucketScannerE(t *testing.T) {
 	}
 	defer db.Close()
 
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	want := map[string]string{"a": "one", "b": "two", "c": "three"}
 	for k, v := range want {
 		if err := b.Set([]byte(k), []byte(v)); err != nil {
@@ -808,7 +818,7 @@ func TestBucketBatchDelete(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	for _, k := range []string{"a", "b", "c", "d", "e"} {
 		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
 			t.Fatalf("set %q: %v", k, err)
@@ -843,7 +853,7 @@ func TestBucketBatchDelete(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer db.Close()
-	b = db.Bucket("b")
+	b = mustBucket(t, db, "b")
 	if all, err := b.GetAll(); err != nil || len(all) != 2 {
 		t.Fatalf("records after reopen = %d, %v; want 2", len(all), err)
 	}
@@ -860,7 +870,7 @@ func TestBucketBatchDeleteWithWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	for _, k := range []string{"a", "b", "c", "d"} {
 		if err := b.Set([]byte(k), []byte(k)); err != nil {
 			t.Fatalf("set %q: %v", k, err)
@@ -878,7 +888,7 @@ func TestBucketBatchDeleteWithWAL(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer db.Close()
-	b = db.Bucket("b")
+	b = mustBucket(t, db, "b")
 	if all, err := b.GetAll(); err != nil || len(all) != 2 {
 		t.Fatalf("after reopen = %d records, %v; want 2", len(all), err)
 	}
@@ -896,7 +906,7 @@ func TestBucketGetterMany(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer db.Close()
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	for _, k := range []string{"a", "b", "c"} {
 		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
 			t.Fatalf("set %q: %v", k, err)
@@ -932,7 +942,7 @@ func TestBucketOrderedScans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	b := db.Bucket("songs")
+	b := mustBucket(t, db, "songs")
 	for _, k := range []string{"b", "a", "c", "aa", "ab"} {
 		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
 			t.Fatalf("set %q: %v", k, err)
@@ -1004,7 +1014,7 @@ func TestBucketOrderedScans(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer db.Close()
-	b = db.Bucket("songs")
+	b = mustBucket(t, db, "songs")
 	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanRange(nil, nil, fn) })
 	eq(keys, []string{"a", "ab", "b", "c"})
 
@@ -1029,7 +1039,7 @@ func TestBucketQuery(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer db.Close()
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 	for i := 1; i <= 10; i++ {
 		k := fmt.Sprintf("k%02d", i)
 		if err := b.Set([]byte(k), []byte(fmt.Sprintf("%d", i))); err != nil {
@@ -1106,7 +1116,7 @@ func TestOrderedScanBatchInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	b := db.Bucket("b")
+	b := mustBucket(t, db, "b")
 
 	if err := b.BatchSet([]KV{
 		{Key: []byte("c"), Value: []byte("3")},
@@ -1148,7 +1158,7 @@ func TestOrderedScansAcrossBuckets(t *testing.T) {
 	}
 	defer db.Close()
 
-	a, b := db.Bucket("a"), db.Bucket("b")
+	a, b := mustBucket(t, db, "a"), mustBucket(t, db, "b")
 	for _, k := range []string{"a2", "a1", "a3"} {
 		if err := a.Set([]byte(k), []byte(k)); err != nil {
 			t.Fatal(err)

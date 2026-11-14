@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/agberohq/oshodi/internal/consts"
+	"github.com/agberohq/oshodi/internal/messaging"
 	"github.com/agberohq/oshodi/internal/storage"
 )
 
@@ -360,7 +361,7 @@ func (b *Bucket) SubscribeWithID(channel string, fn func([]byte)) (int64, func()
 }
 
 // RegisterHandler registers a bucket-scoped handler
-func (b *Bucket) RegisterHandler(name string, fn func([]byte) ([]byte, error)) {
+func (b *Bucket) RegisterHandler(name string, fn messaging.HandlerFunc) {
 	b.db.RegisterHandler(b.name+bucketKeySeparator+name, fn)
 }
 
@@ -370,13 +371,13 @@ func (b *Bucket) UnregisterHandler(name string) {
 }
 
 // Call invokes a bucket-scoped handler
-func (b *Bucket) Call(name string, payload []byte) ([]byte, error) {
-	return b.db.Call(b.name+bucketKeySeparator+name, payload)
+func (b *Bucket) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return b.db.Call(ctx, b.name+bucketKeySeparator+name, payload)
 }
 
 // CallDirect invokes a bucket-scoped handler directly
-func (b *Bucket) CallDirect(name string, payload []byte) ([]byte, error) {
-	return b.db.CallDirect(b.name+bucketKeySeparator+name, payload)
+func (b *Bucket) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	return b.db.CallDirect(ctx, b.name+bucketKeySeparator+name, payload)
 }
 
 // UnsubscribeAll removes all subscribers from a channel

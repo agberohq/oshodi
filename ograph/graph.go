@@ -135,10 +135,18 @@ func Open(db *oshodi.DB) (*Graph, error) {
 	if _, ok := liveHandles[db]; ok {
 		return nil, ErrGraphAlreadyOpen
 	}
+	vertices, err := db.Bucket(vertexBucket)
+	if err != nil {
+		return nil, err
+	}
+	edges, err := db.Bucket(edgeBucket)
+	if err != nil {
+		return nil, err
+	}
 	g := &Graph{
 		db:          db,
-		vertices:    db.Bucket(vertexBucket),
-		edges:       db.Bucket(edgeBucket),
+		vertices:    vertices,
+		edges:       edges,
 		adj:         newAdjacency(),
 		vertexIndex: map[string]vertexMeta{},
 	}
