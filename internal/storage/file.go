@@ -189,8 +189,12 @@ func (f *File) readRecord(reader io.ReaderAt, offset int64, dstBuf []byte, verif
 	bufPtr := metaBufPool.Get().(*[]byte)
 	metaBuf := *bufPtr
 	defer func() {
-		*bufPtr = metaBuf[:0]
-		metaBufPool.Put(bufPtr)
+		// Never recycle oversized buffers: one large key would poison the
+		// pool for every future read.
+		if cap(metaBuf) <= consts.MetaBufferSize*4 {
+			*bufPtr = metaBuf[:0]
+			metaBufPool.Put(bufPtr)
+		}
 	}()
 
 	if cap(metaBuf) < 4 {
@@ -521,6 +525,13 @@ func (f *File) WriteRecord(key, value []byte) (int64, error) {
 		}
 	}
 
+	// Re-check after compression: zstd framing can grow an incompressible
+	// value past the legal length, and a record the readers would reject
+	// must never be written and acknowledged.
+	if valLen > int(MaxLegalValLen) {
+		return 0, ErrCorrupt
+	}
+
 	// valLen == 0 records carry RecordFlagEmptyValue, never the raw/
 	// compressed marker.
 	flag := compressed
@@ -621,7 +632,13 @@ func (f *File) LogicalSize() int64 {
 // Required by db.loadIndex() during startup to ignore pre-allocated zero-padding.
 func (f *File) SetLogicalSize(size int64) {
 	f.logicalSize.Store(size)
-	f.allocatedSize.Store(size)
+	// Never shrink the allocation: loadIndex trims the logical tail after a
+	// torn write and the next append overwrites that tail. Shrinking the
+	// allocation would let growTo physically truncate whatever valid bytes
+	// still sit beyond the trim point.
+	if size > f.allocatedSize.Load() {
+		f.allocatedSize.Store(size)
+	}
 }
 
 func (f *File) Truncate(size int64) error {
@@ -781,6 +798,11 @@ func (f *File) Close() error {
 
 	close(f.stopRetry)
 	f.wg.Wait()
+
+	// Best-effort durability: Close alone does not flush the page cache.
+	// Callers that already Synced lose nothing; a standalone caller gets
+	// acknowledged-write semantics.
+	_ = f.file.Sync()
 
 	f.mmapMu.Lock()
 	if mm := f.mmap.Load(); mm != nil {

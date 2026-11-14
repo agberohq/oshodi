@@ -169,6 +169,13 @@ func (w *WAL) Write(ctx context.Context, key, value []byte) (int64, error) {
 	ownedVal := buf[len(key):]
 
 	w.mu.Lock()
+	// The closed check must sit under the same mutex as the append:
+	// Close's final flush must never race an append that already passed
+	// an unlocked check.
+	if w.closed.Load() {
+		w.mu.Unlock()
+		return 0, ErrWALClosed
+	}
 	offset := w.filePos.Add(int64(rl)) - int64(rl)
 	w.pending = append(w.pending, record{offset: offset, key: ownedKey, value: ownedVal})
 	w.mu.Unlock()
@@ -200,6 +207,11 @@ func (w *WAL) WriteTombstone(ctx context.Context, key []byte) (int64, error) {
 
 	rl := w.recordLen(key, nil, true)
 	w.mu.Lock()
+	// See Write for why the closed check lives under the mutex.
+	if w.closed.Load() {
+		w.mu.Unlock()
+		return 0, ErrWALClosed
+	}
 	offset := w.filePos.Add(int64(rl)) - int64(rl)
 	buf := make([]byte, len(key))
 	copy(buf, key)
@@ -242,6 +254,11 @@ func (w *WAL) BatchWriteTombstones(ctx context.Context, keys [][]byte) error {
 	recs := make([]record, len(keys))
 	pos := 0
 	w.mu.Lock()
+	// See Write for why the closed check lives under the mutex.
+	if w.closed.Load() {
+		w.mu.Unlock()
+		return ErrWALClosed
+	}
 	for i, k := range keys {
 		copy(buf[pos:], k)
 		owned := buf[pos : pos+len(k)]
@@ -311,6 +328,19 @@ func (w *WAL) flushToDisk() error {
 
 	_, err := w.file.WriteAt(buf[:encoded], flushPos)
 	if err != nil {
+		// Re-queue the batch at the front of the pending queue in its
+		// original order: writers already received these offsets, so
+		// dropping the batch would silently lose acknowledged records,
+		// and advancing flushPos past them would corrupt the offset
+		// contract for every later record. Copy into a fresh slice so
+		// pending and pendingSpare never alias.
+		requeued := make([]record, 0, len(batch)+len(w.pending))
+		requeued = append(requeued, batch...)
+		requeued = append(requeued, w.pending...)
+		w.pending = requeued
+		for i := range batch {
+			batch[i] = record{}
+		}
 		return err
 	}
 
@@ -439,6 +469,9 @@ func (w *WAL) recover() error {
 		if err := w.file.Truncate(offset); err != nil {
 			return err
 		}
+		if err := w.file.Sync(); err != nil {
+			return err
+		}
 		w.filePos.Store(offset)
 		w.flushPos.Store(offset)
 	}
@@ -485,9 +518,12 @@ func (w *WAL) Close() error {
 		w.wg.Wait()
 	}
 
-	_ = w.flushToDisk()
-
-	return w.file.Close()
+	flushErr := w.flushToDisk()
+	closeErr := w.file.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }
 
 func (w *WAL) Size() int64 {
