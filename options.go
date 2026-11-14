@@ -177,6 +177,9 @@ func WithLifetime(lifetime *jack.Lifetime) Option {
 }
 
 // WithPubSubPayloadCopy delivers each subscriber its own payload copy.
+// Copying is already the default; pass false to share one payload slice
+// across all subscribers of a channel, which is only safe when every
+// subscriber is provably read-only.
 func WithPubSubPayloadCopy(enable bool) Option {
 	return func(c *Config) {
 		c.PubSubPayloadCopy = enable

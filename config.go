@@ -77,6 +77,10 @@ type Config struct {
 	EnableWriteCoalescing bool
 
 	// PubSubPayloadCopy gives every subscriber its own payload copy.
+	// Copying is the default: with a shared payload, one subscriber
+	// mutating the slice corrupts it for every other subscriber on the
+	// channel. Power users whose subscribers are provably read-only can
+	// opt into the zero-copy path with WithPubSubPayloadCopy(false).
 	PubSubPayloadCopy bool
 
 	// Hooks intercept Set/Get/Delete (optional, may be nil).
@@ -115,5 +119,9 @@ func DefaultConfig() *Config {
 		DisableWAL:    true,
 		MaxKeySize:    consts.DefaultMaxKeySize, // keeps the decoder unambiguous
 		MaxValueSize:  consts.DefaultMaxValueSize,
+
+		// Subscribers get independent payload copies unless explicitly
+		// opted out via WithPubSubPayloadCopy(false).
+		PubSubPayloadCopy: true,
 	}
 }
