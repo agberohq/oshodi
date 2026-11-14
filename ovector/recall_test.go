@@ -142,6 +142,63 @@ func TestSearchRecallQuality(t *testing.T) {
 	}
 }
 
+// TestSearchDeterministicOrder pins the result ordering: identical queries
+// must return identical orders even when distances tie, because map
+// iteration inside the search is randomised and only the boundary sort
+// makes the output comparable.
+func TestSearchDeterministicOrder(t *testing.T) {
+	const (
+		n = 200
+		d = 8
+		k = 10
+	)
+
+	dir := t.TempDir()
+	db, err := oshodi.Open(filepath.Join(dir, "det.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	idx, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { idx.Close() })
+
+	idx.Rng = rand.New(rand.NewSource(42))
+
+	// Distinct vectors: distances are distinct, so repeated queries must
+	// return the same results in the same order. (With exactly tied
+	// distances — e.g. duplicate vectors — the result *set* itself depends
+	// on visit order, which the boundary sort cannot fix.)
+	for i := 0; i < n; i++ {
+		vec := make(Vec, d)
+		vec[i%d] = float32(i/d + 1)
+		if err := idx.Add(fmt.Sprintf("v%03d", i), vec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	query := make(Vec, d)
+	for i := range query {
+		query[i] = float32(i + 1)
+	}
+	first, err := idx.Search(query, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for run := 0; run < 20; run++ {
+		again, err := idx.Search(query, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(first, again) {
+			t.Fatalf("search order not deterministic:\nfirst  %v\nrun %d  %v", first, run, again)
+		}
+	}
+}
+
 func BenchmarkVectorSearch(b *testing.B) {
 	const (
 		n        = 2000

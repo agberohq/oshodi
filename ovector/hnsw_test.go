@@ -565,7 +565,11 @@ func TestRebuildDimMismatchCounted(t *testing.T) {
 	if err := idx1.Close(); err != nil {
 		t.Fatalf("close idx1: %v", err)
 	}
-	if err := db1.Bucket(vectorBucket).Set([]byte("b"), encodeVectorRecord([]float32{1, 0})); err != nil {
+	vb, err := db1.Bucket(vectorBucket)
+	if err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+	if err := vb.Set([]byte("b"), encodeVectorRecord([]float32{1, 0})); err != nil {
 		t.Fatalf("seed mismatched record: %v", err)
 	}
 	if err := db1.Close(); err != nil {

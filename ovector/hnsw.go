@@ -1,6 +1,7 @@
 package ovector
 
 import (
+	"cmp"
 	"container/heap"
 	"math"
 	"math/rand"
@@ -145,22 +146,15 @@ func (n *hnswNode) search(k, efSearch int, target Vec, dist DistanceFunc) []*sea
 			break
 		}
 
-		neighborKeys := make([]string, 0, len(current.neighbors))
-		for nk := range current.neighbors {
-			neighborKeys = append(neighborKeys, nk)
-		}
-		slices.Sort(neighborKeys)
-
-		for _, nk := range neighborKeys {
-			neighbor := current.neighbors[nk]
+		// Only candidates that make it into the result set are explored
+		// further (HNSW Algorithm 2); worse ones are pruned.
+		for nk, neighbor := range current.neighbors {
 			if visited[nk] {
 				continue
 			}
 			visited[nk] = true
 			d := dist(neighbor.value, target)
 
-			// Only candidates that make it into the result set are explored
-			// further (HNSW Algorithm 2); worse ones are pruned.
 			if result.Len() < efSearch {
 				sc := &searchCandidate{node: neighbor, dist: d}
 				heap.Push(result, sc)
@@ -179,8 +173,15 @@ func (n *hnswNode) search(k, efSearch int, target Vec, dist DistanceFunc) []*sea
 	for result.Len() > 0 {
 		out = append(out, heap.Pop(result).(*searchCandidate))
 	}
-	// The max-heap pops worst-first; reverse to best-first.
-	slices.Reverse(out)
+	// The max-heap pops worst-first. Sort best-first with a deterministic
+	// key tie-break: map iteration order inside the search is randomised,
+	// so only this boundary sort makes repeated queries comparable.
+	slices.SortFunc(out, func(a, b *searchCandidate) int {
+		if a.dist != b.dist {
+			return cmp.Compare(a.dist, b.dist)
+		}
+		return cmp.Compare(a.node.key, b.node.key)
+	})
 	// Trim to k if we have more.
 	if len(out) > k {
 		out = out[:k]
@@ -251,14 +252,22 @@ func Open(db *oshodi.DB) (*Index, error) {
 	}
 	idx := &Index{
 		db:       db,
-		vectors:  db.Bucket(vectorBucket),
-		edges:    db.Bucket(edgeBucket),
 		Distance: CosineDistance,
 		M:        DefaultM,
 		Ml:       DefaultMl,
 		EfSearch: DefaultEfSearch,
 		Rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+	vectors, err := db.Bucket(vectorBucket)
+	if err != nil {
+		return nil, err
+	}
+	edges, err := db.Bucket(edgeBucket)
+	if err != nil {
+		return nil, err
+	}
+	idx.vectors = vectors
+	idx.edges = edges
 	if err := idx.rebuild(); err != nil {
 		return nil, err
 	}
