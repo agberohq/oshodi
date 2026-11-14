@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Traversal correctness against a naive reference implementation on
 // random graphs, including MutateID/Mutate/Filter/Dedup and ordering.

@@ -1,4 +1,4 @@
-package vector
+package ovector
 
 import (
 	"container/heap"
@@ -21,7 +21,7 @@ var (
 // hnswNode is a node in one layer of the HNSW graph.
 type hnswNode struct {
 	key   string
-	value Vector
+	value Vec
 	// neighbors maps neighbor keys to neighbor nodes at this layer.
 	neighbors map[string]*hnswNode
 }
@@ -118,7 +118,7 @@ func (h *candidateHeap) worst() *searchCandidate { return h.items[0] }
 // It uses the standard HNSW early-termination condition: stop when the
 // closest unvisited candidate is worse than the worst result in the
 // efSearch-bounded result set.
-func (n *hnswNode) search(k, efSearch int, target Vector, dist DistanceFunc) []*searchCandidate {
+func (n *hnswNode) search(k, efSearch int, target Vec, dist DistanceFunc) []*searchCandidate {
 	// The exploration budget must be at least k, or the result set can't
 	// hold all k neighbors.
 	if efSearch < k {
@@ -345,7 +345,7 @@ func maxLevel(ml float64, numNodes int) int {
 // If a vector with an existing key is included, it is replaced.
 func (idx *Index) AddMany(pairs ...struct {
 	Key string
-	Vec Vector
+	Vec Vec
 }) error {
 	if len(pairs) == 0 {
 		return nil
@@ -423,7 +423,7 @@ func (idx *Index) AddMany(pairs ...struct {
 // Add inserts a vector into the index. If another vector with the same key
 // exists, it is replaced. The key is persisted in the bucket; the embedding
 // is stored in the value.
-func (idx *Index) Add(key string, vec Vector) error {
+func (idx *Index) Add(key string, vec Vec) error {
 	if key == "" {
 		return ErrInvalidIdentity
 	}
@@ -502,7 +502,7 @@ type SearchResult struct {
 }
 
 // Search finds the k nearest neighbors to the query vector.
-func (idx *Index) Search(near Vector, k int) ([]string, error) {
+func (idx *Index) Search(near Vec, k int) ([]string, error) {
 	results, err := idx.SearchWithDistance(near, k)
 	if err != nil {
 		return nil, err
@@ -517,7 +517,7 @@ func (idx *Index) Search(near Vector, k int) ([]string, error) {
 // SearchWithDistance finds the k nearest neighbors to the query vector,
 // returning both keys and distances. It returns no results if k is not
 // positive.
-func (idx *Index) SearchWithDistance(near Vector, k int) ([]SearchResult, error) {
+func (idx *Index) SearchWithDistance(near Vec, k int) ([]SearchResult, error) {
 	if k <= 0 {
 		return nil, nil
 	}
@@ -592,8 +592,8 @@ func (idx *Index) deleteLocked(key string) bool {
 }
 
 // Lookup returns the stored vector for a key.
-func (idx *Index) Lookup(key string) (Vector, error) {
-	var vec Vector
+func (idx *Index) Lookup(key string) (Vec, error) {
+	var vec Vec
 	err := idx.runTraversal(func() error {
 		if len(idx.layers) == 0 {
 			return ErrVectorNotFound

@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Benchmarks for adjacency mutation, traversal and algorithms.
 

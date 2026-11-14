@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Liveness and contract tests for the findings in lab/report.md §12
 // (panic-safety, lock discipline, lifecycle, multi-handle, dirty gating).

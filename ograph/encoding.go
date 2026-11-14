@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 import (
 	"encoding/binary"

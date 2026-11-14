@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Model-based concurrency test, Jepsen-inspired: random graph mutations
 // across workers are checked against an in-memory model. The core

@@ -97,15 +97,42 @@ bucket.RegisterHandler("echo", func(req []byte) ([]byte, error) {
 response, _ := bucket.Call("echo", []byte("ping"))
 ```
 
+## Vector Search
+
+Oshodi ships an approximate nearest neighbor index (HNSW) on top of the
+same storage engine. Embeddings are ordinary records; the graph is
+rebuilt on open.
+
+```go
+import "github.com/agberohq/oshodi/ovector"
+
+idx, err := ovector.Open(db)
+if err != nil {
+    log.Fatal(err)
+}
+defer idx.Close()
+
+idx.Add("face:1", ovector.Vec{0.1, 0.2, 0.3})
+
+// nearest neighbors by cosine distance
+hits, _ := idx.Search([]float32{0.1, 0.2, 0.3}, 5)
+
+// with distances
+res, _ := idx.SearchWithDistance([]float32{0.1, 0.2, 0.3}, 5)
+```
+
+Cosine distance by default, Euclidean available. One index handle per
+database; corrupt records are skipped and counted in `Stats`.
+
 ## Graph Traversals
 
 Oshodi ships a property graph layer on top of the same storage engine.
 Vertices and edges are ordinary records; adjacency is rebuilt on open.
 
 ```go
-import "github.com/agberohq/oshodi/graph"
+import "github.com/agberohq/oshodi/ograph"
 
-g, err := graph.Open(db)
+g, err := ograph.Open(db)
 if err != nil {
     log.Fatal(err)
 }
@@ -120,7 +147,7 @@ n, _ := g.V("artist:1").Out("performs").Has("name", "hotline bling").Count()
 
 // algorithms: PageRank over every vertex, BFS distances
 pr, _ := g.PageRank(0.85, 20)
-dist, _ := g.BFS("artist:1", graph.Outgoing)
+dist, _ := g.BFS("artist:1", ograph.Outgoing)
 
 // user-defined map over the element stream (never writes)
 ids, _ := g.V("Artist:1").MutateID(strings.ToLower).Out("performs").IDs()

@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Recovery tests: truncation/bit-rot of the edge bucket never produces a
 // torn adjacency; dangling edges are dropped; corrupted/foreign records are

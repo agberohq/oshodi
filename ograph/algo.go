@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Graph-pure analytics over the adjacency index. PageRank, BFS and
 // Components hold the graph's shared read lock for their entire

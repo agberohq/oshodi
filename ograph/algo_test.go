@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 // Algorithm contracts from plan v3 §6.
 

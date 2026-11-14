@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 import (
 	"fmt"
@@ -15,7 +15,7 @@ func (g *Graph) rebuild() error {
 	// used by HasLabel.
 	index, err := g.loadVertexIndex()
 	if err != nil {
-		return fmt.Errorf("graph: rebuild vertices: %w", err)
+		return fmt.Errorf("ograph: rebuild vertices: %w", err)
 	}
 	g.vertexIndex = index
 	var dangling []string
@@ -39,7 +39,7 @@ func (g *Graph) rebuild() error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("graph: rebuild scan: %w", err)
+		return fmt.Errorf("ograph: rebuild scan: %w", err)
 	}
 
 	for _, id := range dangling {

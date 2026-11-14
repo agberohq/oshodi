@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 import (
 	"errors"
@@ -9,7 +9,7 @@ import (
 	"github.com/agberohq/oshodi"
 )
 
-var errForeignRecord = errors.New("graph: foreign or corrupt record")
+var errForeignRecord = errors.New("ograph: foreign or corrupt record")
 
 // Live-handle registry: one graph handle per *oshodi.DB. Two handles would
 // silently maintain divergent adjacency indexes over the same buckets.
@@ -183,7 +183,7 @@ func (g *Graph) runMutation(op func() error) (err error) {
 		// invariant. Mark dirty and surface it as an error.
 		if r := recover(); r != nil {
 			g.markDirty()
-			err = fmt.Errorf("graph: mutation failed and index marked dirty: %v", r)
+			err = fmt.Errorf("ograph: mutation failed and index marked dirty: %v", r)
 		}
 	}()
 	if g.closing {

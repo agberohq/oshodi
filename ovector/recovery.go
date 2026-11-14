@@ -1,4 +1,4 @@
-package vector
+package ovector
 
 import (
 	"math/rand"
@@ -16,7 +16,7 @@ func (idx *Index) rebuild() error {
 	// the HNSW layers and neighbor relationships.
 	var vectors []struct {
 		key string
-		vec Vector
+		vec Vec
 	}
 
 	err := idx.vectors.ScannerE(nil, func(key []byte, value []byte) error {
@@ -27,7 +27,7 @@ func (idx *Index) rebuild() error {
 		}
 		vectors = append(vectors, struct {
 			key string
-			vec Vector
+			vec Vec
 		}{key: string(key), vec: vec})
 		return nil
 	})

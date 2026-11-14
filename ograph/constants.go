@@ -1,4 +1,4 @@
-package graph
+package ograph
 
 import "github.com/agberohq/oshodi/internal/consts"
 

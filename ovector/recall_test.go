@@ -1,4 +1,4 @@
-package vector
+package ovector
 
 import (
 	"cmp"
@@ -14,12 +14,12 @@ import (
 // item is a keyed vector used by the recall harness.
 type item struct {
 	key string
-	vec Vector
+	vec Vec
 }
 
 // bruteTopK computes the exact k nearest neighbors of q among items using
 // dist, as the ground truth for recall measurement.
-func bruteTopK(items []item, q Vector, k int, dist DistanceFunc) map[string]bool {
+func bruteTopK(items []item, q Vec, k int, dist DistanceFunc) map[string]bool {
 	type scored struct {
 		key string
 		d   float32
@@ -38,10 +38,10 @@ func bruteTopK(items []item, q Vector, k int, dist DistanceFunc) map[string]bool
 	return out
 }
 
-func randomVectors(rng *rand.Rand, n, d int) []Vector {
-	vecs := make([]Vector, n)
+func randomVectors(rng *rand.Rand, n, d int) []Vec {
+	vecs := make([]Vec, n)
 	for i := range vecs {
-		v := make(Vector, d)
+		v := make(Vec, d)
 		for j := range v {
 			v[j] = float32(rng.NormFloat64())
 		}
@@ -53,7 +53,7 @@ func randomVectors(rng *rand.Rand, n, d int) []Vector {
 // buildRecallFixture builds a deterministic index of n random d-dimensional
 // vectors plus a query set, using the index's own distance function. ef is
 // the exploration budget used both for construction and for queries.
-func buildRecallFixture(tb testing.TB, n, d, nQueries, ef int) (*Index, []item, []Vector) {
+func buildRecallFixture(tb testing.TB, n, d, nQueries, ef int) (*Index, []item, []Vec) {
 	tb.Helper()
 
 	dataRng := rand.New(rand.NewSource(7))

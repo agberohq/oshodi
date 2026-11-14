@@ -1,8 +1,8 @@
-package vector
+package ovector
 
 import "github.com/agberohq/oshodi/internal/consts"
 
-// Vector-layer constants live here so bucket names, record framing and
+// Ovector-layer constants live here so bucket names, record framing and
 // algorithm defaults have a single definition.
 const (
 	vectorBucket = consts.VectorBucketVectors
