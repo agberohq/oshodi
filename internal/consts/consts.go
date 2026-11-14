@@ -118,11 +118,11 @@ const (
 
 // Vector layer.
 const (
-	VectorBucketVectors  = "vector:v"
-	VectorBucketEdges    = "vector:e"
-	VectorRecordMagic    = 0x56 // 'V'
-	VectorRecordVersion  = 1
-	VectorM              = 16
-	VectorMl             = 0.25
-	VectorEfSearch       = 20
+	VectorBucketVectors = "vector:v"
+	VectorBucketEdges   = "vector:e"
+	VectorRecordMagic   = 0x56 // 'V'
+	VectorRecordVersion = 1
+	VectorM             = 16
+	VectorMl            = 0.25
+	VectorEfSearch      = 20
 )

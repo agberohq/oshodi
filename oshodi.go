@@ -152,6 +152,9 @@ func (db *DB) Scan(ctx context.Context, opts *ScanOptions, fn func(key, value []
 	if db.closed.Load() {
 		return ErrClosed
 	}
+	if opts == nil {
+		opts = &ScanOptions{}
+	}
 	engineOpts := &engine.ScanOptions{
 		Concurrency: opts.Concurrency,
 		BatchSize:   opts.BatchSize,
@@ -208,6 +211,9 @@ func (db *DB) Map(ctx context.Context, opts *MapReduceOptions, fn MapFunc) ([]Ma
 	if db.closed.Load() {
 		return nil, ErrClosed
 	}
+	if opts == nil {
+		opts = &MapReduceOptions{}
+	}
 	engineOpts := &engine.MapReduceOptions{
 		Concurrency:    opts.Concurrency,
 		BatchSize:      opts.BatchSize,
@@ -263,6 +269,9 @@ func (db *DB) MapReduce(
 ) (map[string][]byte, error) {
 	if db.closed.Load() {
 		return nil, ErrClosed
+	}
+	if opts == nil {
+		opts = &MapReduceOptions{}
 	}
 	engineOpts := &engine.MapReduceOptions{
 		Concurrency:    opts.Concurrency,
@@ -421,6 +430,9 @@ func (b *Bucket) Has(key []byte) bool {
 
 // GetAll returns all key-value pairs in the bucket
 func (b *Bucket) GetAll() ([]KV, error) {
+	if b.db.closed.Load() {
+		return nil, ErrClosed
+	}
 	kvs, err := b.inner.GetAll()
 	if err != nil {
 		return nil, err
@@ -438,6 +450,9 @@ func (b *Bucket) GetAll() ([]KV, error) {
 
 // Scan iterates over all key-value pairs without copying
 func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
 	return b.inner.Scan(fn)
 }
 
