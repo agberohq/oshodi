@@ -55,14 +55,18 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 
 	var val []byte
 	var hit bool
-	c.data.Update(h, func(entry cacheEntry, exists bool) cacheEntry {
+	c.data.Compute(h, func(entry cacheEntry, exists bool) (cacheEntry, bool) {
 		if !exists || !bytes.Equal(entry.key, key) {
-			return entry
+			// Miss: keep=false on an absent key is a no-op. An Update here
+			// would insert a junk entry on every miss, and eviction only
+			// runs inside Set, so read-mostly workloads would grow without
+			// bound.
+			return cacheEntry{}, false
 		}
 		entry.access = c.access.Add(1)
 		val = entry.val
 		hit = true
-		return entry
+		return entry, true
 	})
 	if !hit {
 		return nil, false
@@ -85,14 +89,15 @@ func (c *Cache) View(key []byte, fn func(value []byte) error) (ok bool, err erro
 
 	var val []byte
 	var hit bool
-	c.data.Update(h, func(entry cacheEntry, exists bool) cacheEntry {
+	c.data.Compute(h, func(entry cacheEntry, exists bool) (cacheEntry, bool) {
 		if !exists || !bytes.Equal(entry.key, key) {
-			return entry
+			// See Get: never insert on a miss.
+			return cacheEntry{}, false
 		}
 		entry.access = c.access.Add(1)
 		val = entry.val
 		hit = true
-		return entry
+		return entry, true
 	})
 	if !hit {
 		return false, nil
