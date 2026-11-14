@@ -57,6 +57,7 @@ type DB struct {
 	writeCommitMu sync.RWMutex
 	compactMu     sync.Mutex
 	coalescer     *writeCoalescer
+	flushMu       sync.Mutex
 	wal           atomic.Pointer[storage.WAL]
 
 	stop      chan struct{}
@@ -259,6 +260,7 @@ func NewDB(config *Config) (*DB, error) {
 	storeCfg.Compressor = compressor
 	store, err := storage.NewFile(storeCfg)
 	if err != nil {
+		_ = lockFile.Close()
 		return nil, err
 	}
 	idx := NewIndex(config.BloomExpectedItems, config.BloomFalsePositiveRate)
@@ -269,7 +271,8 @@ func NewDB(config *Config) (*DB, error) {
 		Store:      store,
 	})
 	if err != nil {
-		store.Close()
+		_ = store.Close()
+		_ = lockFile.Close()
 		return nil, err
 	}
 
@@ -315,20 +318,20 @@ func NewDB(config *Config) (*DB, error) {
 		walCfg := newWALConfig(config, config.FilePath+storage.FilenameSuffixWAL)
 		wal, err := storage.NewWAL(walCfg)
 		if err != nil {
-			store.Close()
+			_ = store.Close()
+			_ = lockFile.Close()
 			return nil, err
 		}
 		db.wal.Store(wal)
 	}
 
-	// Rebuild the index whenever the file has bytes in it. The first bytes
-	// may be a preallocation hole rather than the first record: a run that
-	// preallocated the file and exited before its first write leaves a zero
-	// prefix, and the next run appends records after it. Gating this on
-	// IsEmpty() (which only inspected offset 0) then skipped the rebuild
-	// forever, so the whole catalogue opened as empty. loadIndex skips the
-	// prefix and sets the write cursor to the last record boundary.
-	if store.Size() > 0 {
+	// Rebuild the index whenever the file has logical bytes in it. The
+	// first bytes may be a preallocation hole rather than the first record:
+	// a run that preallocated the file and exited before its first write
+	// leaves a zero prefix, and the next run appends records after it.
+	// loadIndex skips the prefix and sets the write cursor to the last
+	// record boundary.
+	if store.LogicalSize() > 0 {
 		if err := db.loadIndex(); err != nil {
 			db.Close()
 			return nil, err
@@ -338,44 +341,17 @@ func NewDB(config *Config) (*DB, error) {
 	// Replay WAL entries to recover writes that were not flushed to main storage.
 	// ReadNext returns raw bytes: keyLen[4LE] | key | valueLen[4LE] | value.
 	if wal := db.wal.Load(); wal != nil && wal.FileSize() > 0 {
-		reader := wal.NewReader(0)
-		replayCount := 0
-		for {
-			data, err := reader.ReadNext(nil)
-			if err != nil {
-				break
-			}
-			if len(data) < 8 {
-				continue
-			}
-			// WAL uses LittleEndian — must match the encoding in wal.Write.
-			keyLen := binary.LittleEndian.Uint32(data[0:4])
-			if uint32(len(data)) < 8+keyLen {
-				continue
-			}
-			key := data[4 : 4+keyLen]
-			valueLen := binary.LittleEndian.Uint32(data[4+keyLen : 4+keyLen+4])
-			if uint32(len(data)) < 8+keyLen+valueLen {
-				continue
-			}
-
-			var value []byte
-			if valueLen > 0 && valueLen != storage.WALTombstoneValLen {
-				value = data[4+keyLen+4 : 4+keyLen+4+valueLen]
-			}
-
-			isDelete := valueLen == storage.WALTombstoneValLen
-
-			if isDelete {
-				_ = db.Delete(key)
-			} else {
-				_ = db.Set(key, value)
-			}
-			replayCount++
+		replayed, err := db.replayWAL(wal.NewReader(0))
+		if err != nil {
+			_ = db.Close()
+			return nil, err
 		}
-		if replayCount > 0 {
-			db.logger.Fields("replayed", replayCount).Info("WAL recovery successful")
-			db.Flush()
+		if replayed > 0 {
+			db.logger.Fields("replayed", replayed).Info("WAL recovery successful")
+			if err := db.Flush(); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 		}
 	}
 
@@ -484,9 +460,9 @@ func (db *DB) loadIndex() error {
 	return nil
 }
 
-// Set stores a key-value pair. It writes to the WAL first if enabled,
-// then to the main storage under a read-lock that blocks during compaction swaps,
-// and finally updates the index and cache.
+// Set stores a key-value pair. Hooks run first; the WAL entry (which holds
+// the post-hook value), the record write and the index update then commit
+// under a read-lock that blocks during compaction swaps and Flush rotation.
 func (db *DB) Set(key, value []byte) error {
 	if db.closed.Load() {
 		return ErrDBClosed
@@ -501,19 +477,6 @@ func (db *DB) Set(key, value []byte) error {
 		return ErrValueTooLarge
 	}
 
-	if wal := db.wal.Load(); wal != nil {
-		_, err := wal.Write(context.Background(), key, value)
-		if err != nil && errors.Is(err, storage.ErrWALClosed) {
-			if newWal := db.wal.Load(); newWal != nil && newWal != wal {
-				_, err = newWal.Write(context.Background(), key, value)
-			}
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	// Hooks run after the WAL write; OnWrite may still reject the commit.
 	if db.hooks != nil && db.hooks.OnWrite != nil {
 		transformed, err := db.hooks.OnWrite(pipeline.HookContext{Bucket: "", Key: key, Value: value})
 		if err != nil {
@@ -528,16 +491,57 @@ func (db *DB) Set(key, value []byte) error {
 	return db.commitDirect(key, value)
 }
 
-// commitDirect is the uncoalesced write path: one record, immediate index
-// and cache update under the shared write lock.
-func (db *DB) commitDirect(key, value []byte) error {
-	// Hold RLock so Compact's write-lock waits for in-flight writes to drain
-	// before swapping the storage pointer.
-	offset, err := func() (int64, error) {
-		db.writeCommitMu.RLock()
-		defer db.writeCommitMu.RUnlock()
-		return db.writer.WriteRecord(key, value)
-	}()
+// replayWAL applies recovered records straight to main storage. It bypasses
+// the WAL (these entries came from it), the write hooks (the WAL already
+// holds post-hook values; applying OnWrite again would double-transform) and
+// the coalescer (a solo leader per entry would wait out the batch window
+// once per record). Errors abort the open rather than recovering silently
+// with partial data.
+func (db *DB) replayWAL(reader *storage.WALReader) (int, error) {
+	replayed := 0
+	for {
+		data, err := reader.ReadNext(nil)
+		if err != nil {
+			break
+		}
+		if len(data) < 8 {
+			continue
+		}
+		// WAL uses LittleEndian — must match the encoding in wal.Write.
+		keyLen := binary.LittleEndian.Uint32(data[0:4])
+		if uint32(len(data)) < 8+keyLen {
+			continue
+		}
+		key := data[4 : 4+keyLen]
+		valueLen := binary.LittleEndian.Uint32(data[4+keyLen : 4+keyLen+4])
+		if uint32(len(data)) < 8+keyLen+valueLen {
+			continue
+		}
+
+		isDelete := valueLen == storage.WALTombstoneValLen
+		if isDelete {
+			if err := db.commitRecoveredDelete(key); err != nil {
+				return replayed, err
+			}
+		} else {
+			var value []byte
+			if valueLen > 0 {
+				value = data[4+keyLen+4 : 4+keyLen+4+valueLen]
+			}
+			if err := db.commitRecovered(key, value); err != nil {
+				return replayed, err
+			}
+		}
+		replayed++
+	}
+	return replayed, nil
+}
+
+// commitRecovered writes one recovered record directly to main storage.
+func (db *DB) commitRecovered(key, value []byte) error {
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
+	offset, err := db.writer.WriteRecord(key, value)
 	if err != nil {
 		return err
 	}
@@ -546,6 +550,56 @@ func (db *DB) commitDirect(key, value []byte) error {
 	db.cache.Delete(key)
 	db.invalidateOrderedKeys(key)
 	return nil
+}
+
+// commitRecoveredDelete writes one recovered tombstone directly to main storage.
+func (db *DB) commitRecoveredDelete(key []byte) error {
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
+	off, err := db.writer.WriteTombstone(key)
+	if err != nil {
+		return err
+	}
+	db.index.Load().DeleteIfStale(key, off)
+	db.cache.Delete(key)
+	db.invalidateOrderedKeys(key)
+	return nil
+}
+
+// commitDirect is the uncoalesced write path: WAL entry, record write, and
+// index update all inside the shared commit lock so Flush's sync+rotation
+// and a compaction swap can never straddle them.
+func (db *DB) commitDirect(key, value []byte) error {
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
+
+	if wal := db.wal.Load(); wal != nil {
+		if err := db.writeWALRecord(wal, key, value); err != nil {
+			return err
+		}
+	}
+
+	offset, err := db.writer.WriteRecord(key, value)
+	if err != nil {
+		return err
+	}
+	db.metrics.Add(key)
+	db.index.Load().SetIfNewer(key, offset)
+	db.cache.Delete(key)
+	db.invalidateOrderedKeys(key)
+	return nil
+}
+
+// writeWALRecord appends one record to wal, falling back to the fresh WAL
+// after a rotation.
+func (db *DB) writeWALRecord(wal *storage.WAL, key, value []byte) error {
+	_, err := wal.Write(context.Background(), key, value)
+	if err != nil && errors.Is(err, storage.ErrWALClosed) {
+		if newWal := db.wal.Load(); newWal != nil && newWal != wal {
+			_, err = newWal.Write(context.Background(), key, value)
+		}
+	}
+	return err
 }
 
 // Get retrieves an owned copy of the value for a key. It checks the cache
@@ -675,9 +729,12 @@ func (db *DB) applyReadHook(key, val []byte) ([]byte, error) {
 	return transformed, nil
 }
 
-// Delete removes a key. It writes a tombstone to the WAL and main storage,
-// then removes the entry from the index and cache.
+// Delete removes a key. The OnDelete hook may veto; the tombstone, its WAL
+// entry and the index retirement commit under the shared commit lock.
 func (db *DB) Delete(key []byte) error {
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
@@ -686,6 +743,9 @@ func (db *DB) Delete(key []byte) error {
 			return err
 		}
 	}
+
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
 
 	if wal := db.wal.Load(); wal != nil {
 		_, err := wal.WriteTombstone(context.Background(), key)
@@ -699,18 +759,11 @@ func (db *DB) Delete(key []byte) error {
 		}
 	}
 
-	var tombstoneOffset int64
-	err := func() error {
-		db.writeCommitMu.RLock()
-		defer db.writeCommitMu.RUnlock()
-		off, err := db.writer.WriteTombstone(key)
-		tombstoneOffset = off
-		return err
-	}()
+	off, err := db.writer.WriteTombstone(key)
 	if err != nil {
 		return err
 	}
-	db.index.Load().DeleteIfStale(key, tombstoneOffset)
+	db.index.Load().DeleteIfStale(key, off)
 	db.cache.Delete(key)
 	db.invalidateOrderedKeys(key)
 	return nil
@@ -732,6 +785,14 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 		}
 		if len(k) > db.config.MaxKeySize {
 			return ErrKeyTooLarge
+		}
+	}
+
+	if db.hooks != nil && db.hooks.OnDelete != nil {
+		for _, k := range keys {
+			if err := db.hooks.OnDelete(pipeline.HookContext{Key: k}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -787,25 +848,30 @@ func (db *DB) BatchSet(entries []KV) error {
 		}
 	}
 
+	// OnWrite transforms each entry before anything is written; hook code
+	// must not run under the commit lock.
+	if db.hooks != nil && db.hooks.OnWrite != nil {
+		for i := range entries {
+			transformed, err := db.hooks.OnWrite(pipeline.HookContext{Bucket: "", Key: entries[i].Key, Value: entries[i].Value})
+			if err != nil {
+				return err
+			}
+			entries[i].Value = transformed
+		}
+	}
+
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
+
 	if wal := db.wal.Load(); wal != nil {
 		for i := range entries {
-			_, err := wal.Write(context.Background(), entries[i].Key, entries[i].Value)
-			if err != nil && errors.Is(err, storage.ErrWALClosed) {
-				if newWal := db.wal.Load(); newWal != nil && newWal != wal {
-					_, err = newWal.Write(context.Background(), entries[i].Key, entries[i].Value)
-				}
-			}
-			if err != nil {
+			if err := db.writeWALRecord(wal, entries[i].Key, entries[i].Value); err != nil {
 				return err
 			}
 		}
 	}
 
-	offsets, err := func() ([]int64, error) {
-		db.writeCommitMu.RLock()
-		defer db.writeCommitMu.RUnlock()
-		return db.writer.BatchWriteRecord(entries)
-	}()
+	offsets, err := db.writer.BatchWriteRecord(entries)
 	if err != nil {
 		return err
 	}
@@ -824,11 +890,16 @@ func (db *DB) BatchSet(entries []KV) error {
 	return nil
 }
 
-// Flush forces all pending writes to disk and rotates the WAL.
-// It syncs main storage first, then closes the old WAL, removes the file,
-// and creates a fresh WAL for future writes. The sync happens before WAL
-// deletion so a crash between the two leaves a recoverable WAL on disk.
+// Flush forces all pending writes to disk and rotates the WAL. Rotation is
+// serialized (no concurrent double-rotation) and holds the commit lock, so a
+// writer's WAL entry can never land after the final sync, and an Open during
+// the drain always sees the old handle still live.
 func (db *DB) Flush() error {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+	db.writeCommitMu.Lock()
+	defer db.writeCommitMu.Unlock()
+
 	if err := db.writer.Flush(); err != nil {
 		return err
 	}
@@ -957,10 +1028,10 @@ func (db *DB) Compact() error {
 	}
 
 	// Reconcile deletes: keys copied in phase 1 that were deleted while the
-	// copy ran are gone from oldIndex by now; without this pass they would
-	// be resurrected by the new index.
+	// copy ran now carry a tombstone watermark (a negative offset) in
+	// oldIndex, so Has reports them absent and they are dropped here.
 	newIndex.Range(func(key []byte, offset int64) bool {
-		if offset < snapshotOffset && !oldIndex.Has(key) {
+		if !oldIndex.Has(key) {
 			newIndex.Delete(key)
 		}
 		return true

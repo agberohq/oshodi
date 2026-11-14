@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -38,6 +39,10 @@ func (db *DB) Scan(ctx context.Context, opts *ScanOptions, fn func(key, value []
 
 	return db.scanParallel(ctx, opts, fn)
 }
+
+// errScanStopped marks a parallel-scan enumeration that stopped because
+// every worker had already exited; it is never surfaced to callers.
+var errScanStopped = errors.New("scan stopped")
 
 // scanSequential iterates all keys in index order, reading each value.
 func (db *DB) scanSequential(ctx context.Context, fn func(key, value []byte) error) error {
@@ -90,6 +95,8 @@ func (db *DB) scanParallel(ctx context.Context, opts *ScanOptions, fn func(key, 
 
 	work := make(chan task, batchSize)
 	errCh := make(chan error, concurrency)
+	stopped := make(chan struct{})
+	prodDone := make(chan struct{})
 	var werr error
 
 	var wg sync.WaitGroup
@@ -120,21 +127,31 @@ func (db *DB) scanParallel(ctx context.Context, opts *ScanOptions, fn func(key, 
 	}
 
 	go func() {
+		defer close(prodDone)
 		defer close(work)
 		if e := idx.Scan(func(key []byte, offset int64) error {
 			select {
 			case <-ctx.Done():
 				werr = ctx.Err()
 				return werr
+			case <-stopped:
+				// Every worker exited on an error; no receiver is left to
+				// drain the channel, so stop enumerating instead of
+				// blocking forever.
+				return errScanStopped
 			case work <- task{key: key, offset: offset}:
 				return nil
 			}
-		}); e != nil && werr == nil {
+		}); e != nil && e != errScanStopped && werr == nil {
 			werr = e
 		}
 	}()
 
 	wg.Wait()
+	close(stopped)
+	// The producer may still be running; it escapes via stopped above, and
+	// joining it here makes the werr read below race-free.
+	<-prodDone
 	close(errCh)
 	for err := range errCh {
 		if err != nil {

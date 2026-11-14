@@ -29,13 +29,32 @@ func (idx *Index) Set(key []byte, offset int64) {
 	idx.bloom.Add(key)
 }
 
+// Tombstone watermarks: a negative stored value records the tombstone of a
+// deleted key as -(offset+1), so an in-flight Set whose index update has not
+// landed yet cannot resurrect the key once the delete has committed. Live
+// offsets are always >= 0, so the sign is unambiguous.
+
+func tombstoneMark(tombstoneOffset int64) int64 { return -(tombstoneOffset + 1) }
+
+func markToTombstone(mark int64) int64 { return -mark - 1 }
+
+// newerThan reports whether the stored value represents a write newer than
+// offset. Offsets come from one monotonic counter, so a higher offset is
+// always a later write.
+func newerThan(stored, offset int64) bool {
+	if stored < 0 {
+		return markToTombstone(stored) > offset
+	}
+	return stored > offset
+}
+
 // SetIfNewer stores offset only when the key is absent or the incoming
-// offset is newer — offsets come from one atomic counter, so a higher
-// offset is always a later write. This keeps last-writer-wins true when
-// concurrent writers commit index updates outside write order.
+// offset is newer. This keeps last-writer-wins true when concurrent writers
+// commit index updates outside write order, and refuses offsets that predate
+// a tombstone watermark recorded by DeleteIfStale.
 func (idx *Index) SetIfNewer(key []byte, offset int64) {
 	idx.shards.Update(string(key), func(current int64, exists bool) int64 {
-		if exists && current > offset {
+		if exists && newerThan(current, offset) {
 			return current
 		}
 		return offset
@@ -43,25 +62,36 @@ func (idx *Index) SetIfNewer(key []byte, offset int64) {
 	idx.bloom.Add(key)
 }
 
-// DeleteIfStale removes the key's index entry unless a newer write
-// (offset > tombstoneOffset) is already recorded.
+// DeleteIfStale retires the key's index entry unless a newer write
+// (offset > tombstoneOffset) is already recorded. The tombstone is recorded
+// as a negative watermark either way, so a later stale SetIfNewer cannot
+// resurrect the key.
 func (idx *Index) DeleteIfStale(key []byte, tombstoneOffset int64) {
-	idx.shards.Compute(string(key), func(current int64, exists bool) (int64, bool) {
-		if exists && current > tombstoneOffset {
-			return current, true // keep: a newer Set beats this tombstone
+	idx.shards.Update(string(key), func(current int64, exists bool) int64 {
+		if exists && newerThan(current, tombstoneOffset) {
+			return current // a newer write beats this tombstone
 		}
-		return 0, false
+		return tombstoneMark(tombstoneOffset)
 	})
 }
 
-// Get returns the offset for a key. The boolean indicates existence.
+// Get returns the offset for a key. The boolean indicates existence;
+// tombstone watermarks read as absent.
 func (idx *Index) Get(key []byte) (int64, bool) {
-	return idx.shards.Get(string(key))
+	return idx.get(string(key))
 }
 
 // GetString is Get for callers that already hold the map's string key.
 func (idx *Index) GetString(key string) (int64, bool) {
-	return idx.shards.Get(key)
+	return idx.get(key)
+}
+
+func (idx *Index) get(key string) (int64, bool) {
+	v, ok := idx.shards.Get(key)
+	if ok && v < 0 {
+		return 0, false
+	}
+	return v, ok
 }
 
 // Delete removes a key from the index.
@@ -79,9 +109,9 @@ func (idx *Index) Len() int {
 	return idx.shards.Len()
 }
 
-// Has reports whether a key currently has an index entry.
+// Has reports whether a key currently has a live index entry.
 func (idx *Index) Has(key []byte) bool {
-	_, ok := idx.shards.Get(string(key))
+	_, ok := idx.get(string(key))
 	return ok
 }
 
@@ -95,23 +125,30 @@ func (idx *Index) BloomFPR() float64 {
 	return idx.bloom.EstimatedFPR()
 }
 
-// Range iterates over all keys in arbitrary order.
-// The function receives a copy of the key and its offset.
-// Return false from the callback to stop iteration.
+// Range iterates over all live keys in arbitrary order. The function
+// receives a copy of the key and its offset. Return false from the callback
+// to stop iteration. Tombstone watermarks are skipped.
 func (idx *Index) Range(fn func(key []byte, offset int64) bool) {
 	idx.shards.Range(func(k string, v int64) bool {
+		if v < 0 {
+			return true
+		}
 		return fn([]byte(k), v)
 	})
 }
 
-// Scan iterates over all keys in arbitrary order, supporting error propagation.
-// The function receives a copy of the key and its offset.
-// Return an error from the callback to abort the scan.
+// Scan iterates over all live keys in arbitrary order, supporting error
+// propagation. The function receives a copy of the key and its offset.
+// Return an error from the callback to abort the scan. Tombstone watermarks
+// are skipped.
 func (idx *Index) Scan(fn func(key []byte, offset int64) error) error {
 	var result error
 	idx.shards.Range(func(k string, v int64) bool {
 		if result != nil {
 			return false
+		}
+		if v < 0 {
+			return true
 		}
 		if err := fn([]byte(k), v); err != nil {
 			result = err
@@ -124,7 +161,13 @@ func (idx *Index) Scan(fn func(key []byte, offset int64) error) error {
 
 // RangeString iterates like Range but passes the map's own string key. It
 // avoids materialising a []byte copy per entry, which is the dominant cost of
-// a large scan. The string is immutable and safe to retain.
+// a large scan. The string is immutable and safe to retain. Tombstone
+// watermarks are skipped.
 func (idx *Index) RangeString(fn func(key string, offset int64) bool) {
-	idx.shards.Range(fn)
+	idx.shards.Range(func(k string, v int64) bool {
+		if v < 0 {
+			return true
+		}
+		return fn(k, v)
+	})
 }

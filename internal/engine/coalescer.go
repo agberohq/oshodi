@@ -129,12 +129,22 @@ func (c *writeCoalescer) take(sh *coalesceShard, want int) []*pendingSet {
 	return batch
 }
 
-// drain hands the current queue to the leader, optionally growing the
-// window up to batchMin within batchTimeout while entries keep arriving.
-// The returned batch always contains the leader's own entry (len >= 1).
+// drain hands the current queue to the leader. A batch grows up to batchMin
+// only while entries are actually still arriving; a solo entry commits
+// immediately instead of paying the full window for followers that never
+// come.
 func (c *writeCoalescer) drain(sh *coalesceShard) []*pendingSet {
 	batch := c.take(sh, -1)
+	if len(batch) == 0 {
+		return batch
+	}
 	if c.batchMin > 1 && len(batch) < c.batchMin {
+		sh.mu.Lock()
+		more := len(sh.pending) > 0
+		sh.mu.Unlock()
+		if !more {
+			return batch
+		}
 		timer := time.NewTimer(c.batchTimeout)
 		defer timer.Stop()
 		for len(batch) < c.maxBatch {
@@ -180,34 +190,26 @@ func (db *DB) coalesceSet(key, value []byte) error {
 			db.commitBatch(batch)
 			continue
 		}
-		// Hand leadership back; if a late follower joined mid-commit,
-		// keep draining so its waiter is never stranded.
-		if !db.coalescer.release(sh) {
-			return nil
+		if db.coalescer.release(sh) {
+			// A late follower joined mid-commit; keep draining so its
+			// waiter is never stranded.
+			continue
 		}
+		// Leadership handed back: our own entry was in the first batch we
+		// committed, so its outcome is on our done channel.
+		return <-slot.done
 	}
 }
 
-// commitBatch performs one batched physical write and index update and
-// always completes every waiter — success, error, or leader panic.
+// commitBatch performs one batched physical write, WAL append and index
+// update inside the shared commit lock, and always completes every waiter —
+// success, error, or leader panic.
 func (db *DB) commitBatch(batch []*pendingSet) {
-	defer func() {}()
 	entries := make([]KV, len(batch))
 	for i := range batch {
 		entries[i] = KV{Key: batch[i].key, Value: batch[i].value}
 	}
 
-	var offsets []int64
-	var werr error
-	func() {
-		db.writeCommitMu.RLock()
-		defer db.writeCommitMu.RUnlock()
-		offsets, werr = db.writer.BatchWriteRecord(entries)
-	}()
-
-	// Never mutate the shared *pendingSet fields: a follower may still be
-	// dereferencing its own slot. The buffered done channel is the only
-	// handoff after enqueue.
 	finishAll := func(err error) {
 		for i := range batch {
 			if batch[i].done != nil {
@@ -219,6 +221,8 @@ func (db *DB) commitBatch(batch []*pendingSet) {
 		}
 	}
 
+	// Registered before the commit so a panic anywhere below still resolves
+	// every waiter.
 	defer func() {
 		if r := recover(); r != nil {
 			finishAll(fmt.Errorf("oshodi: batch commit failed: %v", r))
@@ -226,6 +230,19 @@ func (db *DB) commitBatch(batch []*pendingSet) {
 		}
 	}()
 
+	db.writeCommitMu.RLock()
+	defer db.writeCommitMu.RUnlock()
+
+	if wal := db.wal.Load(); wal != nil {
+		for i := range batch {
+			if err := db.writeWALRecord(wal, batch[i].key, batch[i].value); err != nil {
+				finishAll(err)
+				return
+			}
+		}
+	}
+
+	offsets, werr := db.writer.BatchWriteRecord(entries)
 	if werr != nil {
 		finishAll(werr)
 		return
@@ -237,5 +254,14 @@ func (db *DB) commitBatch(batch []*pendingSet) {
 		idx.SetIfNewer(batch[i].key, offsets[i])
 		db.cache.Delete(batch[i].key)
 	}
+	db.invalidateOrderedKeys(keysOfBatch(batch)...)
 	finishAll(nil)
+}
+
+func keysOfBatch(batch []*pendingSet) [][]byte {
+	keys := make([][]byte, len(batch))
+	for i := range batch {
+		keys[i] = batch[i].key
+	}
+	return keys
 }

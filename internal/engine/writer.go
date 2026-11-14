@@ -96,6 +96,13 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 		}
 	}
 
+	// Re-check after compression: zstd framing can grow an incompressible
+	// value past the legal length, and a record the readers would reject
+	// must never be written and acknowledged.
+	if valLen > int(storage.MaxLegalValLen) {
+		return 0, storage.ErrCorrupt
+	}
+
 	keyLen := len(key)
 	payloadSize := 4 + keyLen + 4 + 1 + valLen
 	totalSize := payloadSize + storage.RecordCRCSize
@@ -129,9 +136,7 @@ func (sw *ShardedWriter) WriteRecord(key, value []byte) (int64, error) {
 	// Lock-free write via Offset Reservation Pattern
 	offset, err := sw.store.Load().WriteAtomic(buf)
 
-	// Zero-allocation recycle
-	*bufPtr = buf[:0]
-	shard.bufferPool.Put(bufPtr)
+	putBuffer(&shard.bufferPool, bufPtr, buf, consts.WriterRecordBuffer*4)
 
 	return offset, err
 }
@@ -170,6 +175,9 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 		if valLen == 0 {
 			// Zero-length values carry RecordFlagEmptyValue.
 			flag = storage.RecordFlagEmptyValue
+		}
+		if valLen > int(storage.MaxLegalValLen) {
+			return nil, storage.ErrCorrupt
 		}
 		flags[i] = flag
 		totalSize += 4 + keyLen + 4 + 1 + valLen + storage.RecordCRCSize
@@ -216,6 +224,8 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 
 	// Single lock-free syscall for the entire batch!
 	baseOffset, err := sw.store.Load().WriteAtomic(buf)
+
+	putBuffer(&sw.encoderPool, bufPtr, buf, consts.WriterEncoderBuffer*4)
 	if err != nil {
 		return nil, err
 	}
@@ -232,9 +242,6 @@ func (sw *ShardedWriter) BatchWriteRecord(entries []KV) ([]int64, error) {
 		offsets[i] = currentOffset
 		currentOffset += int64(4 + keyLen + 4 + 1 + valLen + storage.RecordCRCSize)
 	}
-
-	*bufPtr = buf[:0]
-	sw.encoderPool.Put(bufPtr)
 
 	return offsets, nil
 }
@@ -273,8 +280,7 @@ func (sw *ShardedWriter) WriteTombstone(key []byte) (int64, error) {
 
 	offset, err := sw.store.Load().WriteAtomic(buf)
 
-	*bufPtr = buf[:0]
-	shard.bufferPool.Put(bufPtr)
+	putBuffer(&shard.bufferPool, bufPtr, buf, consts.WriterRecordBuffer*4)
 
 	return offset, err
 }
@@ -337,9 +343,9 @@ func (sw *ShardedWriter) BatchWriteTombstones(keys [][]byte) ([]int64, error) {
 	}
 
 	baseOffset, err := sw.store.Load().WriteAtomic(buf)
+
+	putBuffer(&sw.encoderPool, bufPtr, buf, consts.WriterEncoderBuffer*4)
 	if err != nil {
-		*bufPtr = buf[:0]
-		sw.encoderPool.Put(bufPtr)
 		return nil, err
 	}
 
@@ -350,7 +356,14 @@ func (sw *ShardedWriter) BatchWriteTombstones(keys [][]byte) ([]int64, error) {
 		cur += int64(4 + len(k) + 4 + 1 + storage.RecordCRCSize)
 	}
 
-	*bufPtr = buf[:0]
-	sw.encoderPool.Put(bufPtr)
 	return offsets, nil
+}
+
+// putBuffer recycles buf only when it stays near the pool's intended size;
+// an oversized buffer would poison the pool for every later caller.
+func putBuffer(pool *sync.Pool, bufPtr *[]byte, buf []byte, maxSize int) {
+	if cap(buf) <= maxSize {
+		*bufPtr = buf[:0]
+		pool.Put(bufPtr)
+	}
 }

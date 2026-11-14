@@ -3,9 +3,11 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/agberohq/oshodi/internal/consts"
+	"github.com/agberohq/oshodi/internal/storage"
 )
 
 // bucketKeySeparator joins the bucket name and the user key/channel/handler
@@ -149,9 +151,14 @@ func (b *Bucket) Delete(key []byte) error {
 	return b.db.Delete(fullKey)
 }
 
-// GetAll returns all key-value pairs in the bucket
+// GetAll returns all key-value pairs in the bucket. Read errors surface
+// instead of silently skipping records.
 func (b *Bucket) GetAll() ([]KV, error) {
+	if b.db.closed.Load() {
+		return nil, ErrDBClosed
+	}
 	var result []KV
+	var firstErr error
 	idx := b.db.index.Load()
 	idx.Range(func(fullKey []byte, offset int64) bool {
 		if !bytes.HasPrefix(fullKey, b.prefix) {
@@ -165,18 +172,29 @@ func (b *Bucket) GetAll() ([]KV, error) {
 
 		val, err := store.ReadValueAt(offset, fullKey, nil)
 		if err != nil {
-			return true
+			// A stale index/storage pairing mid-compaction is transient;
+			// anything else is a real read error.
+			if errors.Is(err, storage.ErrCorrupt) || errors.Is(err, storage.ErrClosed) {
+				return true
+			}
+			firstErr = err
+			return false
 		}
 		// fullKey and val are already freshly allocated per entry, so they
 		// can be retained without another copy.
 		result = append(result, KV{Key: userKey, Value: val})
 		return true
 	})
-	return result, nil
+	return result, firstErr
 }
 
-// Scan iterates over all key-value pairs without copying
+// Scan iterates over all key-value pairs without copying. Read errors
+// surface instead of silently skipping records.
 func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrDBClosed
+	}
+	var firstErr error
 	idx := b.db.index.Load()
 	idx.Range(func(fullKey []byte, offset int64) bool {
 		if !bytes.HasPrefix(fullKey, b.prefix) {
@@ -190,11 +208,15 @@ func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
 
 		val, err := store.ReadValueAt(offset, fullKey, nil)
 		if err != nil {
-			return true
+			if errors.Is(err, storage.ErrCorrupt) || errors.Is(err, storage.ErrClosed) {
+				return true
+			}
+			firstErr = err
+			return false
 		}
 		return fn(userKey, val)
 	})
-	return nil
+	return firstErr
 }
 
 // Scanner iterates over all key-value pairs in the bucket while reusing its
