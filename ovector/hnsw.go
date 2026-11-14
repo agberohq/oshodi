@@ -278,11 +278,14 @@ func (idx *Index) Close() error {
 	idx.layers = nil
 	idx.coord.Unlock()
 
+	// Wait for in-flight ops before deregistering: an Open during the drain
+	// must see this handle still live, not create a second one over the
+	// same database.
+	idx.ops.Wait()
+
 	handleMu.Lock()
 	delete(liveHandles, idx.db)
 	handleMu.Unlock()
-
-	idx.ops.Wait()
 	return nil
 }
 
