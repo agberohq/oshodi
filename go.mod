@@ -3,13 +3,13 @@ module github.com/agberohq/oshodi
 go 1.26.0
 
 require (
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/oklog/ulid/v2 v2.1.2
-	github.com/olekukonko/jack v0.0.0-20261030105942-08dd4960686b
+	github.com/olekukonko/jack v0.0.0-20261031191033-176ae76d7ebc
 	github.com/olekukonko/ll v0.1.9
 	github.com/olekukonko/mappo v0.0.0-20260329141345-c5de61574284
 	github.com/zeebo/xxh3 v1.1.0
-	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e
+	golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4
 )
 
 require (
