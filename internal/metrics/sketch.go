@@ -4,6 +4,7 @@ import (
 	"math"
 	"sync/atomic"
 
+	"github.com/agberohq/oshodi/internal/consts"
 	"github.com/zeebo/xxh3"
 )
 
@@ -16,8 +17,16 @@ type CountMinSketch struct {
 }
 
 // NewCountMinSketch creates an optimized, lock-free Count-Min Sketch.
-func NewCountMinSketch(epsilon, delta float64) *CountMinSketch {
-	rows := uint32(math.Ceil(math.Log(1.0 / delta)))
+// epsilon bounds the relative over-estimation; confidence is the probability
+// that an estimate stays within that bound (rows = ceil(ln(1/(1-conf)))).
+func NewCountMinSketch(epsilon, confidence float64) *CountMinSketch {
+	if epsilon <= 0 || epsilon >= math.E {
+		epsilon = consts.CMSDefaultEpsilon
+	}
+	if confidence <= 0 || confidence >= 1 {
+		confidence = consts.CMSDefaultConfidence
+	}
+	rows := uint32(math.Ceil(math.Log(1.0 / (1.0 - confidence))))
 
 	cols := uint32(math.Ceil(math.E / epsilon))
 	cols--
