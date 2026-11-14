@@ -474,6 +474,73 @@ func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) er
 	return b.inner.ScanE(ctx, fn)
 }
 
+// ScanRange iterates keys in [start, end) in bytewise key order. A nil start
+// means the beginning of the bucket and a nil end the end of the bucket. key
+// and value are only valid until fn returns; copy anything you retain.
+func (b *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanRange(start, end, fn)
+}
+
+// ScanRangeDesc is ScanRange in reverse key order.
+func (b *Bucket) ScanRangeDesc(start, end []byte, fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanRangeDesc(start, end, fn)
+}
+
+// ScanPrefix iterates keys beginning with prefix in bytewise key order.
+func (b *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanPrefix(prefix, fn)
+}
+
+// ScanPrefixDesc is ScanPrefix in reverse key order.
+func (b *Bucket) ScanPrefixDesc(prefix []byte, fn func(key, value []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanPrefixDesc(prefix, fn)
+}
+
+// ScanRangeKeys is ScanRange without reading values; only the key is passed.
+// The key slice is only valid until fn returns.
+func (b *Bucket) ScanRangeKeys(start, end []byte, fn func(key []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanRangeKeys(start, end, fn)
+}
+
+// ScanRangeKeysDesc is ScanRangeKeys in reverse key order.
+func (b *Bucket) ScanRangeKeysDesc(start, end []byte, fn func(key []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanRangeKeysDesc(start, end, fn)
+}
+
+// ScanPrefixKeys is ScanPrefix without reading values.
+func (b *Bucket) ScanPrefixKeys(prefix []byte, fn func(key []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanPrefixKeys(prefix, fn)
+}
+
+// ScanPrefixKeysDesc is ScanPrefixKeys in reverse key order.
+func (b *Bucket) ScanPrefixKeysDesc(prefix []byte, fn func(key []byte) bool) error {
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+	return b.inner.ScanPrefixKeysDesc(prefix, fn)
+}
+
 // BatchSet writes multiple records; per-entry semantics only, not
 // transactional.
 func (b *Bucket) BatchSet(entries []KV) error {

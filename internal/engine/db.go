@@ -69,6 +69,13 @@ type DB struct {
 	doctor    *jack.Doctor
 	ownPool   bool
 	lockFile  io.Closer
+
+	// Ordered key snapshots for range/prefix/ordered scans, one per bucket.
+	// Writes bump that bucket's generation; the next ordered scan rebuilds
+	// only that bucket's sorted snapshot.
+	orderedMu    sync.Mutex
+	orderedSnaps map[string]*orderedSnapshot
+	orderedGens  map[string]uint64
 }
 
 type Config struct {
@@ -537,6 +544,7 @@ func (db *DB) commitDirect(key, value []byte) error {
 	db.metrics.Add(key)
 	db.index.Load().SetIfNewer(key, offset)
 	db.cache.Delete(key)
+	db.invalidateOrderedKeys(key)
 	return nil
 }
 
@@ -704,6 +712,7 @@ func (db *DB) Delete(key []byte) error {
 	}
 	db.index.Load().DeleteIfStale(key, tombstoneOffset)
 	db.cache.Delete(key)
+	db.invalidateOrderedKeys(key)
 	return nil
 }
 
@@ -752,6 +761,7 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 		idx.DeleteIfStale(keys[i], offsets[i])
 		db.cache.Delete(keys[i])
 	}
+	db.invalidateOrderedKeys(keys...)
 	return nil
 }
 
@@ -806,6 +816,11 @@ func (db *DB) BatchSet(entries []KV) error {
 		idx.SetIfNewer(entries[i].Key, offsets[i])
 		db.cache.Delete(entries[i].Key)
 	}
+	batchKeys := make([][]byte, len(entries))
+	for i := range entries {
+		batchKeys[i] = entries[i].Key
+	}
+	db.invalidateOrderedKeys(batchKeys...)
 	return nil
 }
 
@@ -978,6 +993,7 @@ func (db *DB) Compact() error {
 	db.storage.Store(tmpStore)
 	db.index.Store(newIndex)
 	db.cache.Clear()
+	db.invalidateAllOrderedKeys()
 
 	db.writeCommitMu.Unlock()
 

@@ -59,6 +59,11 @@ func (idx *Index) Get(key []byte) (int64, bool) {
 	return idx.shards.Get(string(key))
 }
 
+// GetString is Get for callers that already hold the map's string key.
+func (idx *Index) GetString(key string) (int64, bool) {
+	return idx.shards.Get(key)
+}
+
 // Delete removes a key from the index.
 func (idx *Index) Delete(key []byte) {
 	idx.shards.Delete(string(key))

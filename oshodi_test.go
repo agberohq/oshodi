@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -921,5 +923,279 @@ func TestBucketGetterMany(t *testing.T) {
 	}
 	if err := b.GetterMany(nil, func(k, v []byte) error { return nil }); err != nil {
 		t.Fatalf("empty batch: %v", err)
+	}
+}
+
+func TestBucketOrderedScans(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordered.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	b := db.Bucket("songs")
+	for _, k := range []string{"b", "a", "c", "aa", "ab"} {
+		if err := b.Set([]byte(k), []byte("v-"+k)); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+
+	collect := func(scan func(fn func(k, v []byte) bool) error) (keys []string, vals []string) {
+		t.Helper()
+		if err := scan(func(k, v []byte) bool {
+			keys = append(keys, string(k))
+			vals = append(vals, string(v))
+			return true
+		}); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		return keys, vals
+	}
+	eq := func(got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("got %v, want %v", got, want)
+			}
+		}
+	}
+
+	keys, vals := collect(func(fn func(k, v []byte) bool) error { return b.ScanRange(nil, nil, fn) })
+	eq(keys, []string{"a", "aa", "ab", "b", "c"})
+	eq(vals, []string{"v-a", "v-aa", "v-ab", "v-b", "v-c"})
+
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanRange([]byte("aa"), []byte("c"), fn) })
+	eq(keys, []string{"aa", "ab", "b"})
+
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanPrefix([]byte("a"), fn) })
+	eq(keys, []string{"a", "aa", "ab"})
+
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanRangeDesc(nil, nil, fn) })
+	eq(keys, []string{"c", "b", "ab", "aa", "a"})
+
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanPrefixDesc([]byte("a"), fn) })
+	eq(keys, []string{"ab", "aa", "a"})
+
+	// Updates and deletes must invalidate the ordered snapshot.
+	if err := b.Set([]byte("b"), []byte("B2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete([]byte("aa")); err != nil {
+		t.Fatal(err)
+	}
+	keys, vals = collect(func(fn func(k, v []byte) bool) error { return b.ScanRange(nil, nil, fn) })
+	eq(keys, []string{"a", "ab", "b", "c"})
+	eq(vals, []string{"v-a", "v-ab", "B2", "v-c"})
+
+	// Compaction swaps the index; scans must still resolve current offsets.
+	if err := db.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanRange(nil, nil, fn) })
+	eq(keys, []string{"a", "ab", "b", "c"})
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	b = db.Bucket("songs")
+	keys, _ = collect(func(fn func(k, v []byte) bool) error { return b.ScanRange(nil, nil, fn) })
+	eq(keys, []string{"a", "ab", "b", "c"})
+
+	// Early stop and empty ranges.
+	var seen []string
+	if err := b.ScanRange(nil, nil, func(k, v []byte) bool {
+		seen = append(seen, string(k))
+		return len(seen) < 2
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eq(seen, []string{"a", "ab"})
+	if err := b.ScanRange([]byte("b"), []byte("b"), func(k, v []byte) bool { t.Fatal("unexpected"); return false }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBucketQuery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "query.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	b := db.Bucket("b")
+	for i := 1; i <= 10; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		if err := b.Set([]byte(k), []byte(fmt.Sprintf("%d", i))); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+
+	if n, err := b.Query().Count(); err != nil || n != 10 {
+		t.Fatalf("Count = %d, %v", n, err)
+	}
+	if n, err := b.Query().Range([]byte("k03"), []byte("k07")).Count(); err != nil || n != 4 {
+		t.Fatalf("Range count = %d, %v", n, err)
+	}
+	if n, err := b.Query().Prefix([]byte("k0")).Count(); err != nil || n != 9 {
+		t.Fatalf("Prefix count = %d, %v", n, err)
+	}
+	if n, err := b.Query().Limit(3).Count(); err != nil || n != 3 {
+		t.Fatalf("Limit count = %d, %v", n, err)
+	}
+	if n, err := b.Query().Limit(0).Count(); err != nil || n != 0 {
+		t.Fatalf("Limit(0) count = %d, %v", n, err)
+	}
+
+	var desc []string
+	if err := b.Query().Descending().Limit(1).ForEach(func(k, v []byte) error {
+		desc = append(desc, string(k))
+		return nil
+	}); err != nil || len(desc) != 1 || desc[0] != "k10" {
+		t.Fatalf("descending = %v, %v", desc, err)
+	}
+
+	even := func(k, v []byte) bool {
+		n, _ := strconv.Atoi(string(v))
+		return n%2 == 0
+	}
+	if n, err := b.Query().Filter(even).Count(); err != nil || n != 5 {
+		t.Fatalf("filtered count = %d, %v", n, err)
+	}
+	value := func(k, v []byte) (float64, error) {
+		return strconv.ParseFloat(string(v), 64)
+	}
+	if sum, err := b.Query().Sum(value); err != nil || sum != 55 {
+		t.Fatalf("sum = %v, %v", sum, err)
+	}
+	if min, found, err := b.Query().Min(value); err != nil || !found || min != 1 {
+		t.Fatalf("min = %v found=%v err=%v", min, found, err)
+	}
+	if max, found, err := b.Query().Max(value); err != nil || !found || max != 10 {
+		t.Fatalf("max = %v found=%v err=%v", max, found, err)
+	}
+	groupKey := func(k, v []byte) (string, error) { return string(k[:2]), nil }
+	if groups, err := b.Query().GroupByCount(groupKey); err != nil || groups["k0"] != 9 || groups["k1"] != 1 {
+		t.Fatalf("group count = %v, %v", groups, err)
+	}
+	if groups, err := b.Query().GroupBySum(groupKey, value); err != nil || groups["k0"] != 45 || groups["k1"] != 10 {
+		t.Fatalf("group sum = %v, %v", groups, err)
+	}
+
+	if _, err := b.Query().Range([]byte("a"), []byte("z")).Prefix([]byte("k")).Count(); !errors.Is(err, ErrQueryConflict) {
+		t.Fatalf("Range+Prefix err = %v, want ErrQueryConflict", err)
+	}
+	wantErr := errors.New("stop")
+	if err := b.Query().ForEach(func(k, v []byte) error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("callback error = %v, want %v", err, wantErr)
+	}
+	if err := b.Query().Prefix(nil).Descending().ForEach(func(k, v []byte) error { return nil }); err != nil {
+		t.Fatalf("prefix-all desc: %v", err)
+	}
+}
+
+func TestOrderedScanBatchInvalidation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "ordered-batch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	b := db.Bucket("b")
+
+	if err := b.BatchSet([]KV{
+		{Key: []byte("c"), Value: []byte("3")},
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	if err := b.ScanRangeKeys(nil, nil, func(k []byte) bool {
+		keys = append(keys, string(k))
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 || keys[0] != "a" || keys[1] != "b" || keys[2] != "c" {
+		t.Fatalf("after BatchSet: %v", keys)
+	}
+
+	if err := b.BatchDelete([][]byte{[]byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	keys = keys[:0]
+	if err := b.ScanPrefixKeys([]byte(""), func(k []byte) bool {
+		keys = append(keys, string(k))
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || keys[0] != "a" || keys[1] != "c" {
+		t.Fatalf("after BatchDelete: %v", keys)
+	}
+}
+
+func TestOrderedScansAcrossBuckets(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "ordered-buckets.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	a, b := db.Bucket("a"), db.Bucket("b")
+	for _, k := range []string{"a2", "a1", "a3"} {
+		if err := a.Set([]byte(k), []byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, k := range []string{"b2", "b1"} {
+		if err := b.Set([]byte(k), []byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	keys := func(bk *Bucket) []string {
+		t.Helper()
+		var out []string
+		if err := bk.ScanRangeKeys(nil, nil, func(k []byte) bool {
+			out = append(out, string(k))
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := keys(a); len(got) != 3 || got[0] != "a1" || got[1] != "a2" || got[2] != "a3" {
+		t.Fatalf("bucket a = %v", got)
+	}
+	if got := keys(b); len(got) != 2 || got[0] != "b1" || got[1] != "b2" {
+		t.Fatalf("bucket b = %v", got)
+	}
+
+	// A write in b must not disturb a's ordered view.
+	if err := b.Set([]byte("b0"), []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(a); len(got) != 3 || got[0] != "a1" {
+		t.Fatalf("bucket a after b write = %v", got)
+	}
+	if got := keys(b); len(got) != 3 || got[0] != "b0" {
+		t.Fatalf("bucket b after write = %v", got)
+	}
+
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(a); len(got) != 3 || got[2] != "a3" {
+		t.Fatalf("bucket a after compact = %v", got)
+	}
+	if got := keys(b); len(got) != 3 || got[2] != "b2" {
+		t.Fatalf("bucket b after compact = %v", got)
 	}
 }
