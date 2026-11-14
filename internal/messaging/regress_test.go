@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -16,10 +17,10 @@ func TestRegisterNilHandler(t *testing.T) {
 	if rr.Has("x") {
 		t.Fatal("nil handler must not register")
 	}
-	if _, err := rr.Call("x", nil); err == nil {
+	if _, err := rr.Call(context.Background(), "x", nil); err == nil {
 		t.Fatal("expected error for unregistered handler")
 	}
-	if _, err := rr.CallDirect("x", nil); err == nil {
+	if _, err := rr.CallDirect(context.Background(), "x", nil); err == nil {
 		t.Fatal("expected error for unregistered handler")
 	}
 }

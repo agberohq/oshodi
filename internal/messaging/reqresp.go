@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -9,8 +10,11 @@ import (
 	"github.com/olekukonko/mappo"
 )
 
-// HandlerFunc is the signature every REQ/RESP handler must satisfy.
-type HandlerFunc func(req []byte) ([]byte, error)
+// HandlerFunc is the signature every REQ/RESP handler must satisfy. The
+// context is cancelled when the caller stops waiting (timeout or parent
+// cancellation), so a handler stuck on a downstream call can observe the
+// abandonment and exit instead of leaking its goroutine.
+type HandlerFunc func(ctx context.Context, req []byte) ([]byte, error)
 
 // callResult holds the outcome of a single Call invocation so the channel
 // carries a single typed value instead of an anonymous struct literal.
@@ -22,11 +26,6 @@ type callResult struct {
 // resultPool avoids allocating a buffered channel on every Call.
 var resultPool = sync.Pool{
 	New: func() any { return make(chan callResult, 1) },
-}
-
-// timerPool reuses time.Timer values to avoid per-call heap allocations.
-var timerPool = sync.Pool{
-	New: func() any { return time.NewTimer(consts.TimerIdle) },
 }
 
 // ReqResp manages named request/response handlers using a sharded map.
@@ -75,8 +74,8 @@ func (r *ReqResp) Handlers() []string {
 // runHandler is a package-level goroutine body: passing the values as
 // arguments avoids the heap-allocated closure a `go func(){...}()` would
 // capture on every Call.
-func runHandler(fn HandlerFunc, payload []byte, ch chan callResult) {
-	data, err := fn(payload)
+func runHandler(ctx context.Context, fn HandlerFunc, payload []byte, ch chan callResult) {
+	data, err := fn(ctx, payload)
 	select {
 	case ch <- callResult{data: data, err: err}:
 	default:
@@ -85,9 +84,13 @@ func runHandler(fn HandlerFunc, payload []byte, ch chan callResult) {
 
 // Call invokes the named handler with timeout protection. It runs the handler
 // in its own goroutine so a blocking handler cannot block the caller past the
-// timeout; use CallDirect for handlers known to return promptly, as it avoids
-// the goroutine and channel round trip.
-func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
+// timeout; the handler's context is cancelled when the caller stops waiting,
+// whether by timeout or parent cancellation. Use CallDirect for handlers known
+// to return promptly, as it avoids the goroutine and channel round trip.
+func (r *ReqResp) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fn, ok := r.handlers.Get(name)
 	if !ok || fn == nil {
 		return nil, fmt.Errorf("no handler registered for %q", name)
@@ -95,42 +98,38 @@ func (r *ReqResp) Call(name string, payload []byte) ([]byte, error) {
 
 	ch := resultPool.Get().(chan callResult)
 
-	go runHandler(fn, payload, ch)
-
-	// Reuse a pooled timer to avoid heap allocation.
-	timer := timerPool.Get().(*time.Timer)
-	timer.Reset(r.timeout)
+	// The handler observes callCtx, so a stuck handler exits once the
+	// caller stops waiting instead of leaking its goroutine.
+	callCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	go runHandler(callCtx, fn, payload, ch)
 
 	select {
 	case res := <-ch:
-		// A fired-but-undrained channel would deliver a stale firing to
-		// the next pool user as an instant bogus timeout — drain or drop.
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timerPool.Put(timer)
+		cancel()
 		// The handler has sent and returned; the channel is safe to reuse.
 		resultPool.Put(ch)
 		return res.data, res.err
-	case <-timer.C:
-		// The firing was consumed by this select, so the timer is drained.
-		timerPool.Put(timer)
-		// Never recycle ch here: the handler may still be running and will
-		// send its result later. Reusing it would deliver that stale result
+	case <-callCtx.Done():
+		cancel()
+		// The handler may still be running and will send its result later.
+		// Never recycle ch here: reusing it would deliver that stale result
 		// to an unrelated caller. Dropping it lets the buffered send finish
 		// and the channel be collected with the handler.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("call to %q timed out", name)
 	}
 }
 
 // CallDirect invokes the handler in the current goroutine.
-func (r *ReqResp) CallDirect(name string, payload []byte) ([]byte, error) {
+func (r *ReqResp) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fn, ok := r.handlers.Get(name)
 	if !ok || fn == nil {
 		return nil, fmt.Errorf("no handler registered for %q", name)
 	}
-	return fn(payload)
+	return fn(ctx, payload)
 }

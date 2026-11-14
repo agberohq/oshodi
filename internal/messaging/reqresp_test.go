@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -24,11 +25,11 @@ func TestReqRespRegisterAndCall(t *testing.T) {
 	name := "test-handler"
 	expected := []byte("response")
 
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return expected, nil
 	})
 
-	resp, err := rr.Call(name, []byte("request"))
+	resp, err := rr.Call(context.Background(), name, []byte("request"))
 	if err != nil {
 		t.Fatalf("call failed: %v", err)
 	}
@@ -43,11 +44,11 @@ func TestReqRespCallWithError(t *testing.T) {
 	name := "error-handler"
 	expectedErr := errors.New("handler error")
 
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return nil, expectedErr
 	})
 
-	_, err := rr.Call(name, []byte("request"))
+	_, err := rr.Call(context.Background(), name, []byte("request"))
 	if err != expectedErr {
 		t.Errorf("expected %v, got %v", expectedErr, err)
 	}
@@ -56,7 +57,7 @@ func TestReqRespCallWithError(t *testing.T) {
 func TestReqRespCallNotFound(t *testing.T) {
 	rr := NewReqResp(5 * time.Second)
 
-	_, err := rr.Call("nonexistent", []byte("request"))
+	_, err := rr.Call(context.Background(), "nonexistent", []byte("request"))
 	if err == nil {
 		t.Error("expected error for non-existent handler")
 	}
@@ -66,7 +67,7 @@ func TestReqRespUnregister(t *testing.T) {
 	rr := NewReqResp(5 * time.Second)
 
 	name := "test-handler"
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return nil, nil
 	})
 
@@ -87,11 +88,11 @@ func TestReqRespCallDirect(t *testing.T) {
 	name := "direct-handler"
 	expected := []byte("direct-response")
 
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return expected, nil
 	})
 
-	resp, err := rr.CallDirect(name, []byte("request"))
+	resp, err := rr.CallDirect(context.Background(), name, []byte("request"))
 	if err != nil {
 		t.Fatalf("call direct failed: %v", err)
 	}
@@ -104,12 +105,12 @@ func TestReqRespTimeout(t *testing.T) {
 	rr := NewReqResp(100 * time.Millisecond)
 
 	name := "slow-handler"
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		time.Sleep(200 * time.Millisecond)
 		return []byte("response"), nil
 	})
 
-	_, err := rr.Call(name, []byte("request"))
+	_, err := rr.Call(context.Background(), name, []byte("request"))
 	if err == nil {
 		t.Error("expected timeout error")
 	}
@@ -120,7 +121,7 @@ func TestReqRespHandlersList(t *testing.T) {
 
 	handlers := []string{"handler1", "handler2", "handler3"}
 	for _, h := range handlers {
-		rr.Register(h, func(req []byte) ([]byte, error) {
+		rr.Register(h, func(ctx context.Context, req []byte) ([]byte, error) {
 			return nil, nil
 		})
 	}
@@ -144,7 +145,7 @@ func TestReqRespConcurrentRegistration(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numHandlers; j++ {
 				name := "handler" + string(rune(id)) + "-" + string(rune(j))
-				rr.Register(name, func(req []byte) ([]byte, error) {
+				rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 					return nil, nil
 				})
 			}
@@ -161,7 +162,7 @@ func TestReqRespConcurrentRegistration(t *testing.T) {
 func BenchmarkReqRespCall(b *testing.B) {
 	rr := NewReqResp(5 * time.Second)
 	name := "bench-handler"
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return []byte("response"), nil
 	})
 
@@ -170,14 +171,14 @@ func BenchmarkReqRespCall(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rr.Call(name, payload)
+		rr.Call(context.Background(), name, payload)
 	}
 }
 
 func BenchmarkReqRespCallDirect(b *testing.B) {
 	rr := NewReqResp(5 * time.Second)
 	name := "bench-handler"
-	rr.Register(name, func(req []byte) ([]byte, error) {
+	rr.Register(name, func(ctx context.Context, req []byte) ([]byte, error) {
 		return []byte("response"), nil
 	})
 
@@ -186,7 +187,7 @@ func BenchmarkReqRespCallDirect(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rr.CallDirect(name, payload)
+		rr.CallDirect(context.Background(), name, payload)
 	}
 }
 
@@ -202,16 +203,16 @@ func TestCallTimeoutDoesNotDeliverStaleResult(t *testing.T) {
 	defer slowOnce.Do(func() { close(releaseSlow) })
 	defer fastOnce.Do(func() { close(releaseFast) })
 
-	rr.Register("slow", func([]byte) ([]byte, error) {
+	rr.Register("slow", func(ctx context.Context, req []byte) ([]byte, error) {
 		<-releaseSlow
 		return []byte("slow"), nil
 	})
-	if _, err := rr.Call("slow", nil); err == nil {
+	if _, err := rr.Call(context.Background(), "slow", nil); err == nil {
 		t.Fatal("slow call did not time out")
 	}
 
 	fastStarted := make(chan struct{})
-	rr.Register("fast", func([]byte) ([]byte, error) {
+	rr.Register("fast", func(ctx context.Context, req []byte) ([]byte, error) {
 		close(fastStarted)
 		<-releaseFast
 		return []byte("fast"), nil
@@ -224,7 +225,7 @@ func TestCallTimeoutDoesNotDeliverStaleResult(t *testing.T) {
 		fastOnce.Do(func() { close(releaseFast) })
 	}()
 
-	got, err := rr.Call("fast", nil)
+	got, err := rr.Call(context.Background(), "fast", nil)
 	if err != nil {
 		t.Fatalf("fast call: %v", err)
 	}
