@@ -80,7 +80,8 @@ func takeField(b []byte, pos int) (string, int, error) {
 		return "", 0, errForeignRecord
 	}
 	length, used := binary.Uvarint(b[pos:])
-	if used <= 0 || pos+used+int(length) > len(b) {
+	// A corrupt varint near 2^64 would wrap to a negative int here.
+	if used <= 0 || length > uint64(len(b)) || pos+used+int(length) > len(b) {
 		return "", 0, errForeignRecord
 	}
 	start := pos + used
@@ -88,13 +89,18 @@ func takeField(b []byte, pos int) (string, int, error) {
 }
 
 // takeFieldRest reads the final length-prefixed field whose content extends
-// to the end of the record (the props blob).
+// to the end of the record (the props blob). Trailing bytes beyond the
+// declared length make the record foreign.
 func takeFieldRest(b []byte, pos int) ([]byte, int, error) {
 	if pos >= len(b) {
 		return nil, 0, errForeignRecord
 	}
 	length, used := binary.Uvarint(b[pos:])
-	if used <= 0 || pos+used+int(length) > len(b) {
+	// A corrupt varint near 2^64 would wrap to a negative int here.
+	if used <= 0 || length > uint64(len(b)) || pos+used+int(length) > len(b) {
+		return nil, 0, errForeignRecord
+	}
+	if end := pos + used + int(length); end != len(b) {
 		return nil, 0, errForeignRecord
 	}
 	start := pos + used

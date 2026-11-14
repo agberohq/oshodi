@@ -1,5 +1,7 @@
 package ograph
 
+import "math"
+
 // Graph-pure analytics over the adjacency index. PageRank, BFS and
 // Components hold the graph's shared read lock for their entire
 // computation, so topology is stable while they run; mutations are excluded
@@ -9,7 +11,8 @@ package ograph
 // iterations. Every vertex participates, including isolated ones; vertices
 // without outgoing edges (dangling) redistribute their rank uniformly.
 func (g *Graph) PageRank(damping float64, iterations int) (map[string]float64, error) {
-	if damping <= 0 || damping >= 1 {
+	// NaN fails both comparisons below, so screen it explicitly.
+	if math.IsNaN(damping) || damping <= 0 || damping >= 1 {
 		damping = pageRankDamping
 	}
 	if iterations <= 0 {
@@ -129,11 +132,11 @@ func (g *Graph) KHop(start string, n int, opts KHopOptions) ([]string, error) {
 // bfsLocked walks the adjacency up to maxDepth (-1 = unbounded).
 func (g *Graph) bfsLocked(start string, direction Direction, maxDepth int, includeStart bool) map[string]int {
 	dist := map[string]int{}
-	if maxDepth == 0 {
-		return dist
-	}
 	if includeStart {
 		dist[start] = 0
+	}
+	if maxDepth == 0 {
+		return dist
 	}
 	frontier := []string{start}
 	depth := 0

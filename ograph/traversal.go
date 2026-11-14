@@ -458,8 +458,11 @@ func (t *Traversal) ToList() ([]Element, error) {
 	out := make([]Element, 0, len(t.elems))
 	for i := range t.elems {
 		el := t.elems[i]
-		props, _, err := t.elementProps(el)
-		if err == nil {
+		props, ok, err := t.elementProps(el)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			el.Props = props
 		}
 		out = append(out, el)
@@ -529,8 +532,11 @@ func (t *Traversal) Iterate(fn func(Element) error) error {
 	}
 	for i := range t.elems {
 		el := t.elems[i]
-		props, _, err := t.elementProps(el)
-		if err == nil {
+		props, ok, err := t.elementProps(el)
+		if err != nil {
+			return err
+		}
+		if ok {
 			el.Props = props
 		}
 		if err := fn(el); err != nil {
@@ -667,8 +673,7 @@ func (t *Traversal) lazyIDs() ([]string, error) {
 // immediately: the set for each stage is materialized as the chain is
 // built, and errors are surfaced by the terminal op.
 func (t *Traversal) step(fn func() error) {
-	t.g.ops.Add(1)
-	defer t.g.ops.Done()
+	// See Graph.runMutation for the closing/ops.Add ordering.
 	t.g.coord.RLock()
 	defer t.g.coord.RUnlock()
 	if t.g.closing {
@@ -677,6 +682,8 @@ func (t *Traversal) step(fn func() error) {
 		}
 		return
 	}
+	t.g.ops.Add(1)
+	defer t.g.ops.Done()
 	if t.g.dirty.Load() {
 		if t.err == nil {
 			t.err = ErrIndexDirty
@@ -695,7 +702,10 @@ func (t *Traversal) elementProps(el Element) ([]byte, bool, error) {
 	case VertexElement:
 		raw, err := t.g.vertices.Get([]byte(el.ID))
 		if err != nil {
-			return nil, false, nil // deleted mid-traversal: no props
+			if errors.Is(err, oshodi.ErrKeyNotFound) {
+				return nil, false, nil // deleted mid-traversal: no props
+			}
+			return nil, false, err
 		}
 		_, props, err := decodeVertexRecord(raw)
 		if err != nil {
@@ -705,7 +715,10 @@ func (t *Traversal) elementProps(el Element) ([]byte, bool, error) {
 	case EdgeElement:
 		raw, err := t.g.edges.Get([]byte(el.ID))
 		if err != nil {
-			return nil, false, nil
+			if errors.Is(err, oshodi.ErrKeyNotFound) {
+				return nil, false, nil
+			}
+			return nil, false, err
 		}
 		_, _, _, props, err := decodeEdgeRecord(raw)
 		if err != nil {

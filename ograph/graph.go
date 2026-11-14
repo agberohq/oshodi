@@ -151,8 +151,6 @@ func Open(db *oshodi.DB) (*Graph, error) {
 
 // Close prevents new operations, waits for in-flight ones and releases the
 // adjacency index. It never closes the underlying database.
-// Close prevents new operations, waits for in-flight ones and releases the
-// adjacency index. It never closes the underlying database.
 func (g *Graph) Close() error {
 	g.coord.Lock()
 	if g.closing {
@@ -164,18 +162,22 @@ func (g *Graph) Close() error {
 	g.vertexIndex = nil
 	g.coord.Unlock()
 
+	// Wait for in-flight ops before deregistering: an Open during the drain
+	// must see this handle still live, not create a second one over the
+	// same database.
+	g.ops.Wait()
+
 	handleMu.Lock()
 	delete(liveHandles, g.db)
 	handleMu.Unlock()
-
-	g.ops.Wait()
 	return nil
 }
 
 // runMutation serializes all graph mutations.
 func (g *Graph) runMutation(op func() error) (err error) {
-	g.ops.Add(1)
-	defer g.ops.Done()
+	// closing must be checked before ops.Add: Close takes the write lock
+	// before ops.Wait, so anything registered under the lock has finished
+	// by then, and ops refused here never register.
 	g.coord.Lock()
 	defer g.coord.Unlock()
 	defer func() {
@@ -189,6 +191,8 @@ func (g *Graph) runMutation(op func() error) (err error) {
 	if g.closing {
 		return ErrGraphClosed
 	}
+	g.ops.Add(1)
+	defer g.ops.Done()
 	if g.dirty.Load() {
 		return ErrIndexDirty
 	}
@@ -197,13 +201,14 @@ func (g *Graph) runMutation(op func() error) (err error) {
 
 // runTraversal runs a traversal stage or algorithm under a shared lock.
 func (g *Graph) runTraversal(fn func() error) error {
-	g.ops.Add(1)
-	defer g.ops.Done()
+	// See runMutation for the closing/ops.Add ordering.
 	g.coord.RLock()
 	defer g.coord.RUnlock()
 	if g.closing {
 		return ErrGraphClosed
 	}
+	g.ops.Add(1)
+	defer g.ops.Done()
 	if g.dirty.Load() {
 		return ErrIndexDirty
 	}
