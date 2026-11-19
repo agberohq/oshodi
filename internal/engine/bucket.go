@@ -51,14 +51,22 @@ func (b *Bucket) parseKey(fullKey []byte) []byte {
 	return fullKey[len(b.prefix):]
 }
 
-// Set stores a key-value pair
+// Set stores a key-value pair. An empty key is rejected.
 func (b *Bucket) Set(key, value []byte) error {
+	if len(key) == 0 {
+		return ErrKeyEmpty
+	}
 	fullKey := b.makeKey(key)
 	return b.db.Set(fullKey, value)
 }
 
 // BatchSet stores multiple key-value pairs efficiently in a single lock-free syscall.
 func (b *Bucket) BatchSet(entries []KV) error {
+	for i := range entries {
+		if len(entries[i].Key) == 0 {
+			return ErrKeyEmpty
+		}
+	}
 	namespacedEntries := make([]KV, len(entries))
 	for i, entry := range entries {
 		namespacedEntries[i] = KV{
@@ -151,8 +159,11 @@ func (b *Bucket) Getter(key []byte, fn func(value []byte) error) error {
 	return b.db.Getter(b.makeKey(key), fn)
 }
 
-// Delete removes a key
+// Delete removes a key. An empty key is rejected.
 func (b *Bucket) Delete(key []byte) error {
+	if len(key) == 0 {
+		return ErrKeyEmpty
+	}
 	fullKey := b.makeKey(key)
 	return b.db.Delete(fullKey)
 }
