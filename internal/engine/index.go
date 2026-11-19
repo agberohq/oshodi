@@ -62,6 +62,69 @@ func (idx *Index) SetIfNewer(key []byte, offset int64) {
 	idx.bloom.Add(key)
 }
 
+// noOffset is returned by the publish helpers when a key had no previous
+// version. Offset 0 is a valid record offset, so a zero value cannot be used as
+// the sentinel.
+const noOffset int64 = -1
+
+// PublishOffset installs offset as the key's head if no newer offset is
+// recorded, and returns the offset it displaced. The displaced offset is the
+// exact previous version, so a snapshot can still reach it. A false return
+// means a newer write already won and the caller's record is dead space.
+func (idx *Index) PublishOffset(key []byte, offset int64) (prev int64, won bool) {
+	k := string(key)
+	for {
+		cur, exists := idx.shards.Get(k)
+		if exists && newerThan(cur, offset) {
+			return noOffset, false
+		}
+		if !exists {
+			if _, loaded := idx.shards.SetIfAbsent(k, offset); loaded {
+				continue
+			}
+			idx.bloom.Add(key)
+			return noOffset, true
+		}
+		// A tombstone watermark is stored negated; the history records the
+		// tombstone's own offset so the reader can see the delete.
+		prevOffset := cur
+		if cur < 0 {
+			prevOffset = markToTombstone(cur)
+		}
+		if idx.shards.CompareAndSwap(k, cur, offset) {
+			idx.bloom.Add(key)
+			return prevOffset, true
+		}
+	}
+}
+
+// PublishDelete installs a tombstone watermark for key, returning the live
+// offset it displaced so a snapshot taken before the delete still reads the
+// deleted value. A false return means a newer write already won.
+func (idx *Index) PublishDelete(key []byte, tombstoneOffset int64) (prev int64, won bool) {
+	k := string(key)
+	mark := tombstoneMark(tombstoneOffset)
+	for {
+		cur, exists := idx.shards.Get(k)
+		if exists && newerThan(cur, tombstoneOffset) {
+			return noOffset, false
+		}
+		if !exists {
+			if _, loaded := idx.shards.SetIfAbsent(k, mark); loaded {
+				continue
+			}
+			return noOffset, true
+		}
+		prevOffset := cur
+		if cur < 0 {
+			prevOffset = markToTombstone(cur)
+		}
+		if idx.shards.CompareAndSwap(k, cur, mark) {
+			return prevOffset, true
+		}
+	}
+}
+
 // DeleteIfStale retires the key's index entry unless a newer write
 // (offset > tombstoneOffset) is already recorded. The tombstone is recorded
 // as a negative watermark either way, so a later stale SetIfNewer cannot
@@ -84,6 +147,13 @@ func (idx *Index) Get(key []byte) (int64, bool) {
 // GetString is Get for callers that already hold the map's string key.
 func (idx *Index) GetString(key string) (int64, bool) {
 	return idx.get(key)
+}
+
+// GetRaw returns the stored index value as-is, including the negative
+// tombstone watermark. Snapshot reads need it: a tombstone is a version, and
+// the version behind it is still reachable through history.
+func (idx *Index) GetRaw(key string) (int64, bool) {
+	return idx.shards.Get(key)
 }
 
 func (idx *Index) get(key string) (int64, bool) {
@@ -163,6 +233,13 @@ func (idx *Index) Scan(fn func(key []byte, offset int64) error) error {
 // avoids materialising a []byte copy per entry, which is the dominant cost of
 // a large scan. The string is immutable and safe to retain. Tombstone
 // watermarks are skipped.
+// RangeRaw visits every key with its raw index value, including negative
+// tombstone watermarks. Snapshot scans need those: a key deleted after the
+// snapshot's watermark still holds a value at that watermark.
+func (idx *Index) RangeRaw(fn func(key string, mark int64) bool) {
+	idx.shards.Range(fn)
+}
+
 func (idx *Index) RangeString(fn func(key string, offset int64) bool) {
 	idx.shards.Range(func(k string, v int64) bool {
 		if v < 0 {

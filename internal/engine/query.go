@@ -1,4 +1,4 @@
-package oshodi
+package engine
 
 import (
 	"errors"

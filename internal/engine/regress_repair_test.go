@@ -76,7 +76,7 @@ func TestCoalescedSetVisibleToOrderedScan(t *testing.T) {
 	}
 	defer db.Close()
 
-	b, err := db.GetBucket("b")
+	b, err := db.Bucket("b")
 	if err != nil {
 		t.Fatal(err)
 	}

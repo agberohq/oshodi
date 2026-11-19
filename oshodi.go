@@ -2,7 +2,6 @@ package oshodi
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 
 	"github.com/agberohq/oshodi/internal/engine"
@@ -10,8 +9,8 @@ import (
 )
 
 var (
-	ErrClosed      = errors.New("oshodi: database closed")
-	ErrKeyEmpty    = errors.New("oshodi: key cannot be empty")
+	ErrClosed      = engine.ErrDBClosed
+	ErrKeyEmpty    = engine.ErrKeyEmpty
 	ErrKeyNotFound = engine.ErrKeyNotFound
 
 	// ErrInvalidBucketName rejects bucket names containing NUL bytes, which
@@ -97,14 +96,7 @@ func (db *DB) Close() error {
 // Bucket returns a handle to a named bucket. Names must not contain NUL
 // bytes, which would make keys from two different buckets collide.
 func (db *DB) Bucket(name string) (*Bucket, error) {
-	inner, err := db.inner.GetBucket(name)
-	if err != nil {
-		return nil, err
-	}
-	return &Bucket{
-		inner: inner,
-		db:    db,
-	}, nil
+	return db.inner.Bucket(name)
 }
 
 // Flush forces all pending writes to disk
@@ -120,6 +112,12 @@ func (db *DB) Compact() error {
 // CompactIfNeeded checks and compacts if thresholds are met
 func (db *DB) CompactIfNeeded() error {
 	return db.inner.CompactIfNeeded()
+}
+
+// Snapshot captures a point-in-time read view of the database. Close it when
+// done: an open snapshot defers compaction.
+func (db *DB) Snapshot() (*Snapshot, error) {
+	return db.inner.Snapshot()
 }
 
 // Stats returns database statistics
@@ -347,331 +345,24 @@ func (db *DB) GetAllSubscriptionIDs(channel string) []int64 {
 	return db.inner.GetAllSubscriptionIDs(channel)
 }
 
-// Bucket represents a namespaced collection
-type Bucket struct {
-	inner *engine.Bucket
-	db    *DB
-}
+// Bucket is a namespaced collection of keys. Handles are cheap to create;
+// reuse them rather than calling Bucket per operation.
+type Bucket = engine.Bucket
 
-// Set stores a key-value pair
-func (b *Bucket) Set(key, value []byte) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
-	}
-	return b.inner.Set(key, value)
-}
+// KV represents a key-value pair.
+type KV = engine.KV
 
-// Get retrieves a value by key
-func (b *Bucket) Get(key []byte) ([]byte, error) {
-	if b.db.closed.Load() {
-		return nil, ErrClosed
-	}
-	if len(key) == 0 {
-		return nil, ErrKeyEmpty
-	}
-	return b.inner.Get(key)
-}
+// BucketSnapshot is a point-in-time read view of one bucket.
+type BucketSnapshot = engine.BucketSnapshot
 
-// GetterMany resolves keys in order and calls fn for each present value,
-// skipping missing keys. Values are only valid until fn returns.
-func (b *Bucket) GetterMany(keys [][]byte, fn func(key, value []byte) error) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.GetterMany(keys, fn)
-}
+// Snapshot is a point-in-time read view of the whole database.
+type Snapshot = engine.Snapshot
 
-// Getter retrieves a value and passes it to fn without making an owned copy.
-// The slice is only valid until fn returns; copy it to retain it, and do not
-// mutate it. Use Get when you need an owned copy.
-func (b *Bucket) Getter(key []byte, fn func(value []byte) error) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	if len(key) == 0 {
-		return ErrKeyNotFound
-	}
-	return b.inner.Getter(key, fn)
-}
+// Query is an ordered query builder over one bucket. Use Bucket.Query.
+type Query = engine.Query
 
-// Delete removes a key
-func (b *Bucket) Delete(key []byte) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
-	}
-	return b.inner.Delete(key)
-}
+// ErrQueryConflict is returned when a query combines Range and Prefix.
+var ErrQueryConflict = engine.ErrQueryConflict
 
-// Exists reports whether the key is present without reading its value. It is
-// cheaper than Has for existence checks, but an unreadable record is still
-// reported as existing.
-func (b *Bucket) Exists(key []byte) bool {
-	if b.db.closed.Load() || len(key) == 0 {
-		return false
-	}
-	return b.inner.Exists(key)
-}
-
-// BatchDelete removes multiple keys in one batched write. It is much cheaper
-// than calling Delete per key, especially for cascading deletes.
-func (b *Bucket) BatchDelete(keys [][]byte) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	for _, k := range keys {
-		if len(k) == 0 {
-			return ErrKeyEmpty
-		}
-	}
-	return b.inner.BatchDelete(keys)
-}
-
-// Has checks if a key exists
-func (b *Bucket) Has(key []byte) bool {
-	_, err := b.Get(key)
-	return err == nil
-}
-
-// GetMany reads several keys under one consistent view: every returned value
-// comes from the same generation, and a concurrent BatchSet or BatchDelete is
-// either entirely visible or entirely invisible. Keys that do not exist are
-// omitted. Values are owned copies.
-func (b *Bucket) GetMany(keys [][]byte) ([]KV, error) {
-	if b.db.closed.Load() {
-		return nil, ErrClosed
-	}
-	namespaced := make([][]byte, len(keys))
-	for i, k := range keys {
-		namespaced[i] = b.inner.MakeKey(k)
-	}
-	got, err := b.db.inner.GetMany(namespaced)
-	if err != nil {
-		if errors.Is(err, engine.ErrDBClosed) {
-			return nil, ErrClosed
-		}
-		return nil, err
-	}
-	out := make([]KV, len(got))
-	for i := range got {
-		out[i] = KV{Key: b.inner.ParseKey(got[i].Key), Value: got[i].Value}
-	}
-	return out, nil
-}
-
-// GetAll returns all key-value pairs in the bucket
-func (b *Bucket) GetAll() ([]KV, error) {
-	if b.db.closed.Load() {
-		return nil, ErrClosed
-	}
-	kvs, err := b.inner.GetAll()
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]KV, len(kvs))
-	for i, kv := range kvs {
-		result[i] = KV{
-			Key:   kv.Key,
-			Value: kv.Value,
-		}
-	}
-	return result, nil
-}
-
-// Scan iterates over all key-value pairs without copying
-func (b *Bucket) Scan(fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.Scan(fn)
-}
-
-// Scanner iterates over all key-value pairs while reusing its read buffers
-// instead of allocating a copy per record.
-// key and value are backed by buffers reused for the next record, so both are
-// only valid until fn returns. Copy anything that must outlive the callback;
-// use Scan when the callback needs to retain the slices.
-func (b *Bucket) Scanner(fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.Scanner(fn)
-}
-
-// ScannerE is Scanner with error propagation: context cancellation, storage
-// errors and callback errors all terminate the scan and are returned. key and
-// value are only valid until fn returns.
-func (b *Bucket) ScannerE(ctx context.Context, fn func(key, value []byte) error) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScannerE(ctx, fn)
-}
-
-// ScanE is the error-propagating scan: storage read errors, context
-// cancellation and callback errors terminate the scan and are returned.
-// Iteration order is unspecified; no snapshot isolation. See the graph
-// layer and data-import use cases.
-func (b *Bucket) ScanE(ctx context.Context, fn func(key, value []byte) error) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanE(ctx, fn)
-}
-
-// ScanRange iterates keys in [start, end) in bytewise key order. A nil start
-// means the beginning of the bucket and a nil end the end of the bucket. key
-// and value are only valid until fn returns; copy anything you retain.
-func (b *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanRange(start, end, fn)
-}
-
-// ScanRangeDesc is ScanRange in reverse key order.
-func (b *Bucket) ScanRangeDesc(start, end []byte, fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanRangeDesc(start, end, fn)
-}
-
-// ScanPrefix iterates keys beginning with prefix in bytewise key order.
-func (b *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanPrefix(prefix, fn)
-}
-
-// ScanPrefixDesc is ScanPrefix in reverse key order.
-func (b *Bucket) ScanPrefixDesc(prefix []byte, fn func(key, value []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanPrefixDesc(prefix, fn)
-}
-
-// ScanRangeKeys is ScanRange without reading values; only the key is passed.
-// The key slice is only valid until fn returns.
-func (b *Bucket) ScanRangeKeys(start, end []byte, fn func(key []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanRangeKeys(start, end, fn)
-}
-
-// ScanRangeKeysDesc is ScanRangeKeys in reverse key order.
-func (b *Bucket) ScanRangeKeysDesc(start, end []byte, fn func(key []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanRangeKeysDesc(start, end, fn)
-}
-
-// ScanPrefixKeys is ScanPrefix without reading values.
-func (b *Bucket) ScanPrefixKeys(prefix []byte, fn func(key []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanPrefixKeys(prefix, fn)
-}
-
-// ScanPrefixKeysDesc is ScanPrefixKeys in reverse key order.
-func (b *Bucket) ScanPrefixKeysDesc(prefix []byte, fn func(key []byte) bool) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	return b.inner.ScanPrefixKeysDesc(prefix, fn)
-}
-
-// BatchSet writes multiple records; per-entry semantics only, not
-// transactional.
-func (b *Bucket) BatchSet(entries []KV) error {
-	if b.db.closed.Load() {
-		return ErrClosed
-	}
-	for i := range entries {
-		if len(entries[i].Key) == 0 {
-			return ErrKeyEmpty
-		}
-	}
-	namespaced := make([]engine.KV, len(entries))
-	for i := range entries {
-		namespaced[i] = engine.KV{Key: b.inner.MakeKey(entries[i].Key), Value: entries[i].Value}
-	}
-	return b.db.inner.BatchSet(namespaced)
-}
-
-// EstimatedKeyCount returns estimated unique keys in this bucket
-func (b *Bucket) EstimatedKeyCount() uint64 {
-	return b.inner.EstimatedKeyCount()
-}
-
-// GetKeyFrequency returns estimated frequency of a key
-func (b *Bucket) GetKeyFrequency(key []byte) uint64 {
-	return b.inner.GetKeyFrequency(key)
-}
-
-// Publish sends a message to a channel
-func (b *Bucket) Publish(channel string, payload []byte) (int, error) {
-	return b.inner.Publish(channel, payload)
-}
-
-// Subscribe registers a callback for a channel
-func (b *Bucket) Subscribe(channel string, fn func([]byte)) func() {
-	return b.inner.Subscribe(channel, fn)
-}
-
-// SubscribeWithID registers a callback and returns subscription ID
-func (b *Bucket) SubscribeWithID(channel string, fn func([]byte)) (int64, func()) {
-	return b.inner.SubscribeWithID(channel, fn)
-}
-
-// RegisterHandler registers a bucket-scoped handler
-func (b *Bucket) RegisterHandler(name string, fn func(ctx context.Context, req []byte) ([]byte, error)) {
-	b.inner.RegisterHandler(name, messaging.HandlerFunc(fn))
-}
-
-// UnregisterHandler removes a bucket-scoped handler
-func (b *Bucket) UnregisterHandler(name string) {
-	b.inner.UnregisterHandler(name)
-}
-
-// Call invokes a bucket-scoped handler
-func (b *Bucket) Call(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	return b.inner.Call(ctx, name, payload)
-}
-
-// CallDirect invokes a bucket-scoped handler in current goroutine
-func (b *Bucket) CallDirect(ctx context.Context, name string, payload []byte) ([]byte, error) {
-	return b.inner.CallDirect(ctx, name, payload)
-}
-
-// UnsubscribeAll removes all subscribers from a channel
-func (b *Bucket) UnsubscribeAll(channel string) {
-	b.inner.UnsubscribeAll(channel)
-}
-
-// GetSubscriptionCount returns number of subscribers on a channel
-func (b *Bucket) GetSubscriptionCount(channel string) int {
-	return b.inner.GetSubscriptionCount(channel)
-}
-
-// GetAllSubscriptionIDs returns all subscription IDs on a channel
-func (b *Bucket) GetAllSubscriptionIDs(channel string) []int64 {
-	return b.inner.GetAllSubscriptionIDs(channel)
-}
-
-// KV represents a key-value pair
-type KV struct {
-	Key   []byte
-	Value []byte
-}
+// ErrSnapshotsActive is returned by Compact while a snapshot is open.
+var ErrSnapshotsActive = engine.ErrSnapshotsActive

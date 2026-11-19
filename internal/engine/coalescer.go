@@ -242,6 +242,10 @@ func (db *DB) commitBatch(batch []*pendingSet) {
 		}
 	}
 
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	offsets, werr := db.writer.BatchWriteRecord(entries)
 	if werr != nil {
 		finishAll(werr)
@@ -251,7 +255,9 @@ func (db *DB) commitBatch(batch []*pendingSet) {
 	idx := db.index.Load()
 	for i := range batch {
 		db.metrics.Add(batch[i].key)
-		idx.SetIfNewer(batch[i].key, offsets[i])
+		if prev, won := idx.PublishOffset(batch[i].key, offsets[i]); won && prev >= 0 {
+			db.history.record(string(batch[i].key), prev, db.historyBound())
+		}
 		db.cache.Delete(batch[i].key)
 	}
 	db.invalidateOrderedKeys(keysOfBatch(batch)...)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/agberohq/oshodi/internal/consts"
@@ -166,6 +167,142 @@ func (b *Bucket) Delete(key []byte) error {
 	}
 	fullKey := b.makeKey(key)
 	return b.db.Delete(fullKey)
+}
+
+// Snapshot returns a point-in-time read view of this bucket. Creating one is
+// O(1); Close must be called, and an open view defers compaction.
+func (b *Bucket) Snapshot() (*BucketSnapshot, error) {
+	snap, err := b.db.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &BucketSnapshot{bucket: b, snap: snap}, nil
+}
+
+// BucketSnapshot is a point-in-time read view of one bucket.
+type BucketSnapshot struct {
+	bucket *Bucket
+	snap   *Snapshot
+}
+
+// Watermark returns the offset boundary this view reads at.
+func (bs *BucketSnapshot) Watermark() int64 { return bs.snap.Watermark() }
+
+// Close releases the view.
+func (bs *BucketSnapshot) Close() error { return bs.snap.Close() }
+
+// Get returns the value of key as of the view.
+func (bs *BucketSnapshot) Get(key []byte) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, ErrKeyNotFound
+	}
+	val, ok, err := bs.snap.getFull(string(bs.bucket.MakeKey(key)))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrKeyNotFound
+	}
+	return val, nil
+}
+
+// GetMany returns the values of keys present as of the view, in input order.
+// Missing keys are omitted; values are owned copies.
+func (bs *BucketSnapshot) GetMany(keys [][]byte) ([]KV, error) {
+	out := make([]KV, 0, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		val, ok, err := bs.snap.getFull(string(bs.bucket.MakeKey(key)))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		out = append(out, KV{Key: append([]byte(nil), key...), Value: val})
+	}
+	return out, nil
+}
+
+// ScanRange iterates the keys in [start, end) as of the view, in key order.
+//
+// It resolves each candidate key through the snapshot, so it costs one index
+// read per key in the index (plus one history walk per overwritten key). The
+// scan is bounded by the bucket and the key range, not by the number of
+// versions.
+func (bs *BucketSnapshot) ScanRange(start, end []byte, fn func(key, value []byte) bool) error {
+	prefix := string(bs.bucket.prefix)
+	lo := prefix + string(start)
+	hi := ""
+	if len(end) > 0 {
+		hi = prefix + string(end)
+	}
+
+	var keys []string
+	bs.snap.db.index.Load().RangeRaw(func(k string, _ int64) bool {
+		if !strings.HasPrefix(k, prefix) {
+			return true
+		}
+		if k < lo {
+			return true
+		}
+		if hi != "" && k >= hi {
+			return true
+		}
+		keys = append(keys, k)
+		return true
+	})
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		val, ok, err := bs.snap.getFull(k)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if !fn(bs.bucket.ParseKey([]byte(k)), val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// Has reports whether key exists as of the view.
+func (bs *BucketSnapshot) Has(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	_, ok, err := bs.snap.getFull(string(bs.bucket.MakeKey(key)))
+	return err == nil && ok
+}
+
+// Has reports whether the key exists in this bucket. It is an alias for Exists.
+func (b *Bucket) Has(key []byte) bool {
+	return b.Exists(key)
+}
+
+// GetMany reads several keys under one consistent view: every returned value
+// comes from the same generation, and a concurrent BatchSet or BatchDelete is
+// either entirely visible or entirely invisible. Keys that do not exist are
+// omitted. Values are owned copies.
+func (b *Bucket) GetMany(keys [][]byte) ([]KV, error) {
+	namespaced := make([][]byte, len(keys))
+	for i, k := range keys {
+		namespaced[i] = b.MakeKey(k)
+	}
+	got, err := b.db.GetMany(namespaced)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]KV, len(got))
+	for i := range got {
+		out[i] = KV{Key: b.ParseKey(got[i].Key), Value: got[i].Value}
+	}
+	return out, nil
 }
 
 // GetAll returns all key-value pairs in the bucket. Read errors surface

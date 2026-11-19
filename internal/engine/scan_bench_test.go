@@ -45,7 +45,7 @@ func scanBenchDB(b *testing.B, size int) (*DB, *Bucket) {
 		b.Fatalf("open: %v", err)
 	}
 	b.Cleanup(func() { _ = db.Close() })
-	bk, err := db.GetBucket("s")
+	bk, err := db.Bucket("s")
 	if err != nil {
 		b.Fatal(err)
 	}

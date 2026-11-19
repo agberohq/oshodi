@@ -68,10 +68,16 @@ type DB struct {
 	// the exclusive duration of an index publication, and multi-key reads hold
 	// it shared, so a reader never observes half of a BatchSet/BatchDelete.
 	readViewMu sync.RWMutex
-	compactMu  sync.Mutex
-	coalescer  *writeCoalescer
-	flushMu    sync.Mutex
-	wal        atomic.Pointer[storage.WAL]
+
+	// Snapshot support: in-flight writes bound the watermark, the history keeps
+	// displaced versions reachable, and the registry defers compaction.
+	writes    *writeTracker
+	history   *keyHistory
+	snaps     *snapshotRegistry
+	compactMu sync.Mutex
+	coalescer *writeCoalescer
+	flushMu   sync.Mutex
+	wal       atomic.Pointer[storage.WAL]
 
 	stop      chan struct{}
 	compactCh chan struct{}
@@ -306,6 +312,9 @@ func NewDB(config *Config) (*DB, error) {
 		lifetime:  config.JackLifetime,
 		doctor:    config.JackDoctor,
 		ownPool:   ownPool,
+		writes:    newWriteTracker(),
+		history:   newKeyHistory(),
+		snaps:     newSnapshotRegistry(),
 	}
 
 	if config.EnableWriteCoalescing {
@@ -569,11 +578,19 @@ func (db *DB) commitRecovered(key, value []byte) error {
 func (db *DB) commitRecoveredDelete(key []byte) error {
 	db.writeCommitMu.RLock()
 	defer db.writeCommitMu.RUnlock()
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	off, err := db.writer.WriteTombstone(key)
 	if err != nil {
 		return err
 	}
-	db.index.Load().DeleteIfStale(key, off)
+	db.readViewMu.Lock()
+	if prev, won := db.index.Load().PublishDelete(key, off); won && prev >= 0 {
+		db.history.record(string(key), prev, db.historyBound())
+	}
+	db.readViewMu.Unlock()
 	db.cache.Delete(key)
 	db.invalidateOrderedKeys(key)
 	return nil
@@ -586,6 +603,10 @@ func (db *DB) commitDirect(key, value []byte) error {
 	db.writeCommitMu.RLock()
 	defer db.writeCommitMu.RUnlock()
 
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	if wal := db.wal.Load(); wal != nil {
 		if err := db.writeWALRecord(wal, key, value); err != nil {
 			return err
@@ -597,7 +618,13 @@ func (db *DB) commitDirect(key, value []byte) error {
 		return err
 	}
 	db.metrics.Add(key)
-	db.index.Load().SetIfNewer(key, offset)
+	// Publish the head and record the displaced offset together: a snapshot
+	// must never observe the new head before the old version is recorded.
+	db.readViewMu.Lock()
+	if prev, won := db.index.Load().PublishOffset(key, offset); won && prev >= 0 {
+		db.history.record(string(key), prev, db.historyBound())
+	}
+	db.readViewMu.Unlock()
 	db.cache.Delete(key)
 	db.invalidateOrderedKeys(key)
 	return nil
@@ -826,11 +853,19 @@ func (db *DB) Delete(key []byte) error {
 		}
 	}
 
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	off, err := db.writer.WriteTombstone(key)
 	if err != nil {
 		return err
 	}
-	db.index.Load().DeleteIfStale(key, off)
+	db.readViewMu.Lock()
+	if prev, won := db.index.Load().PublishDelete(key, off); won && prev >= 0 {
+		db.history.record(string(key), prev, db.historyBound())
+	}
+	db.readViewMu.Unlock()
 	db.cache.Delete(key)
 	db.invalidateOrderedKeys(key)
 	return nil
@@ -875,6 +910,10 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 		}
 	}
 
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	offsets, err := func() ([]int64, error) {
 		db.writeCommitMu.RLock()
 		defer db.writeCommitMu.RUnlock()
@@ -887,7 +926,9 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 	idx := db.index.Load()
 	db.readViewMu.Lock()
 	for i := range keys {
-		idx.DeleteIfStale(keys[i], offsets[i])
+		if prev, won := idx.PublishDelete(keys[i], offsets[i]); won && prev >= 0 {
+			db.history.record(string(keys[i]), prev, db.historyBound())
+		}
 		db.cache.Delete(keys[i])
 	}
 	db.invalidateOrderedKeys(keys...)
@@ -940,6 +981,10 @@ func (db *DB) BatchSet(entries []KV) error {
 		}
 	}
 
+	logical := db.storage.Load().LogicalSize()
+	db.writes.begin(logical)
+	defer db.writes.done(logical)
+
 	offsets, err := db.writer.BatchWriteRecord(entries)
 	if err != nil {
 		return err
@@ -951,7 +996,9 @@ func (db *DB) BatchSet(entries []KV) error {
 	db.readViewMu.Lock()
 	for i := range entries {
 		db.metrics.Add(entries[i].Key)
-		idx.SetIfNewer(entries[i].Key, offsets[i])
+		if prev, won := idx.PublishOffset(entries[i].Key, offsets[i]); won && prev >= 0 {
+			db.history.record(string(entries[i].Key), prev, db.historyBound())
+		}
 		db.cache.Delete(entries[i].Key)
 	}
 	batchKeys := make([][]byte, len(entries))
@@ -1000,6 +1047,10 @@ func (db *DB) Flush() error {
 func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
+	if db.snaps.count() > 0 {
+		// Open snapshots read by offset; compaction rewrites every offset.
+		return ErrSnapshotsActive
+	}
 	if db.closed.Load() {
 		return ErrDBClosed
 	}
@@ -1136,6 +1187,9 @@ func (db *DB) Compact() error {
 	db.writer.store.Store(tmpStore)
 	db.storage.Store(tmpStore)
 	db.index.Store(newIndex)
+	// No snapshot is open, so every offset changed and the displaced-version
+	// history is meaningless.
+	db.history.clear()
 	db.cache.Clear()
 	db.invalidateAllOrderedKeys()
 
@@ -1383,12 +1437,12 @@ func (db *DB) GetAllSubscriptionIDs(channel string) []int64 {
 	return db.pubsub.IDs("", channel)
 }
 
-// GetBucket returns a namespaced bucket handle.
 // Buckets isolate keys and provide their own set of methods. Bucket names
 // must not contain NUL bytes: the prefix is name-terminated-by-NUL, and a
 // NUL inside the name would make keys from two different buckets collide
 // byte-for-byte.
-func (db *DB) GetBucket(name string) (*Bucket, error) {
+// Bucket returns a handle to a named bucket, validating the name.
+func (db *DB) Bucket(name string) (*Bucket, error) {
 	if strings.IndexByte(name, 0) >= 0 {
 		return nil, ErrInvalidBucketName
 	}
