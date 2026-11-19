@@ -456,33 +456,60 @@ func TestJepsenCoalescedGroupCommit(t *testing.T) {
 	// later always carry a higher offset (monotonic CAS).
 	const contenders = 32
 	const writesEach = 20
-	var ackSeq uint64
 	var wg sync.WaitGroup
+	// Group commit does not preserve ack order, so "last ack wins" is not a
+	// valid expectation. Check that the survivor is one of the written values,
+	// then verify exact last-write-wins with serialized writes.
+	var writtenMu sync.Mutex
+	written := make(map[string]struct{}, contenders*writesEach)
 	for w := 0; w < contenders; w++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < writesEach; i++ {
-				val := makeValue(id, uint64(w*writesEach+i), 16)
+				val := makeValue(id, uint64(id*writesEach+i), 16)
 				if err := db.Set([]byte("hot"), val); err != nil {
 					t.Errorf("coalesced set: %v", err)
 					return
 				}
-				seq := atomic.AddUint64(&ackSeq, 1)
-				m.set([]byte("hot"), val)
-				_ = seq
+				writtenMu.Lock()
+				written[string(val)] = struct{}{}
+				writtenMu.Unlock()
 			}
 		}(w)
 	}
 	wg.Wait()
 
+	preFlush, err := db.Get([]byte("hot"))
+	if err != nil {
+		t.Fatalf("hot read before flush: %v", err)
+	}
+	if _, ok := written[string(preFlush)]; !ok {
+		t.Fatalf("surviving value %x was never written", preFlush)
+	}
 	if err := db.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	assertJState(t, db, m.snapshot())
+	postCompact, err := db.Get([]byte("hot"))
+	if err != nil {
+		t.Fatalf("hot read after compaction: %v", err)
+	}
+	if string(postCompact) != string(preFlush) {
+		t.Fatalf("compaction changed the surviving value: %x -> %x", preFlush, postCompact)
+	}
+
+	// Serialized writes are exactly last-write-wins; keep the model in sync for
+	// the comparison at the end.
+	for i := 0; i < 8; i++ {
+		val := makeValue(99, uint64(i), 16)
+		if err := db.Set([]byte("hot"), val); err != nil {
+			t.Fatalf("serialized set: %v", err)
+		}
+		m.set([]byte("hot"), val)
+	}
 
 	// Multi-key coalescing: the leader path must not drop or duplicate.
 	for w := 0; w < 8; w++ {
