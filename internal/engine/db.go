@@ -393,7 +393,13 @@ func NewDB(config *Config) (*DB, error) {
 			}
 			db.lifetime.ScheduleTimed(context.Background(), "oshodi.compaction", jack.CallbackCtx(func(ctx context.Context, id string) {
 				if err := db.CompactIfNeeded(); err != nil {
-					db.logger.Fields("error", err).Error("compaction check failed")
+					if errors.Is(err, ErrSnapshotsActive) {
+						// Snapshots are short-lived; retry soon instead of
+						// waiting a whole interval.
+						db.retryCompactionSoon(200 * time.Millisecond)
+					} else {
+						db.logger.Fields("error", err).Error("compaction check failed")
+					}
 				}
 				scheduleCompaction()
 			}), db.config.CompactionInterval)
@@ -1226,6 +1232,25 @@ func fsyncDir(path string) {
 	_ = d.Close()
 }
 
+// retryCompactionSoon retries a deferred compaction after d, so a run blocked
+// by an open snapshot waits for the snapshot instead of a full interval
+// (30 minutes by default).
+func (db *DB) retryCompactionSoon(d time.Duration) {
+	time.AfterFunc(d, func() {
+		if db.closed.Load() {
+			return
+		}
+		err := db.Compact()
+		switch {
+		case err == nil, errors.Is(err, ErrDBClosed):
+		case errors.Is(err, ErrSnapshotsActive):
+			db.retryCompactionSoon(d)
+		default:
+			db.logger.Fields("error", err).Error("compaction retry failed")
+		}
+	})
+}
+
 // CompactIfNeeded checks whether fragmentation exceeds the configured threshold.
 // If compaction is required, it triggers a full compaction.
 func (db *DB) CompactIfNeeded() error {
@@ -1303,11 +1328,19 @@ func (db *DB) processCompaction() {
 		select {
 		case <-db.compactCh:
 			if err := db.Compact(); err != nil {
-				db.logger.Fields("error", err).Error("compaction failed")
+				if errors.Is(err, ErrSnapshotsActive) {
+					db.retryCompactionSoon(200 * time.Millisecond)
+				} else {
+					db.logger.Fields("error", err).Error("compaction failed")
+				}
 			}
 		case <-ticker.C:
 			if err := db.CompactIfNeeded(); err != nil {
-				db.logger.Fields("error", err).Error("compaction check failed")
+				if errors.Is(err, ErrSnapshotsActive) {
+					db.retryCompactionSoon(200 * time.Millisecond)
+				} else {
+					db.logger.Fields("error", err).Error("compaction check failed")
+				}
 			}
 		case <-db.stop:
 			return

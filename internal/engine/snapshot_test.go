@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func testDB(t *testing.T) *DB {
@@ -315,4 +316,42 @@ func TestSnapshotScanRange(t *testing.T) {
 	if len(got) != 2 || got[0] != "b" || got[1] != "c" {
 		t.Fatalf("bounded scan = %v, want [b c]", got)
 	}
+}
+
+// TestCompactionRunsBetweenSnapshots covers a deferred run: compaction is
+// refused while a snapshot is open, and the retry compacts once it closes.
+func TestCompactionRunsBetweenSnapshots(t *testing.T) {
+	db := testDB(t)
+	b := mustBucket(t, db, "snap")
+	for i := 0; i < 500; i++ {
+		if err := b.Set([]byte(fmt.Sprintf("k%04d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap, err := b.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Compact(); !errors.Is(err, ErrSnapshotsActive) {
+		t.Fatalf("compact with a snapshot open = %v, want ErrSnapshotsActive", err)
+	}
+
+	before := db.storage.Load()
+	db.retryCompactionSoon(10 * time.Millisecond)
+	if err := snap.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if db.storage.Load() != before {
+			if v, err := b.Get([]byte("k0000")); err != nil || string(v) != "value" {
+				t.Fatalf("read after compaction = %q, %v", v, err)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("retry did not compact after the snapshot closed")
 }
