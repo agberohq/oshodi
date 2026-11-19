@@ -35,6 +35,11 @@ func (b *Bucket) MakeKey(userKey []byte) []byte {
 	return b.makeKey(userKey)
 }
 
+// ParseKey exposes the bucket-prefix stripping used by batch readers.
+func (b *Bucket) ParseKey(fullKey []byte) []byte {
+	return b.parseKey(fullKey)
+}
+
 // parseKey extracts user key from full key
 func (b *Bucket) parseKey(fullKey []byte) []byte {
 	if len(b.prefix) == 0 {

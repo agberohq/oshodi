@@ -34,6 +34,10 @@ var (
 	ErrInvalidBucketName = errors.New("oshodi: bucket name must not contain NUL bytes")
 	ErrKeyTooLarge       = errors.New("oshodi: key exceeds configured maximum size")
 	ErrValueTooLarge     = errors.New("oshodi: value exceeds configured maximum size")
+
+	// ErrInconsistentView means a multi-key read could not obtain a stable
+	// index/storage pair (compaction swapped them repeatedly). Retryable.
+	ErrInconsistentView = errors.New("oshodi: could not obtain a consistent read view")
 )
 
 type DBStats struct {
@@ -60,10 +64,14 @@ type DB struct {
 
 	// Locks
 	writeCommitMu sync.RWMutex
-	compactMu     sync.Mutex
-	coalescer     *writeCoalescer
-	flushMu       sync.Mutex
-	wal           atomic.Pointer[storage.WAL]
+	// readViewMu publishes a batch to readers as one step: writers hold it for
+	// the exclusive duration of an index publication, and multi-key reads hold
+	// it shared, so a reader never observes half of a BatchSet/BatchDelete.
+	readViewMu sync.RWMutex
+	compactMu  sync.Mutex
+	coalescer  *writeCoalescer
+	flushMu    sync.Mutex
+	wal        atomic.Pointer[storage.WAL]
 
 	stop      chan struct{}
 	compactCh chan struct{}
@@ -658,6 +666,60 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return nil, ErrKeyNotFound
 }
 
+// GetMany reads several keys under one consistent view.
+//
+// All values come from the same index/storage generation, and batch
+// publication takes the same lock exclusively, so a concurrent BatchSet or
+// BatchDelete is either entirely visible or entirely invisible to this call.
+// Keys that do not exist are omitted; values are owned copies. Reads bypass the
+// cache, which can hold values from a later batch.
+func (db *DB) GetMany(keys [][]byte) ([]KV, error) {
+	if db.closed.Load() {
+		return nil, ErrDBClosed
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	db.readViewMu.RLock()
+	defer db.readViewMu.RUnlock()
+
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		idx := db.index.Load()
+		store := db.storage.Load()
+
+		out := make([]KV, 0, len(keys))
+		stale := false
+		for _, key := range keys {
+			if len(key) == 0 || !idx.MaybeHas(key) {
+				continue
+			}
+			offset, ok := idx.Get(key)
+			if !ok {
+				continue
+			}
+			val, err := store.ReadValueAt(offset, key, nil)
+			if err != nil {
+				if errors.Is(err, storage.ErrCorrupt) || errors.Is(err, storage.ErrClosed) {
+					// Compaction swapped the generation under us; start over so
+					// every key comes from the same index/storage pair.
+					stale = true
+					break
+				}
+				return nil, err
+			}
+			cp := make([]byte, len(val))
+			copy(cp, val)
+			out = append(out, KV{Key: key, Value: cp})
+		}
+		if !stale {
+			return out, nil
+		}
+	}
+	return nil, ErrInconsistentView
+}
+
 // Getter resolves key and passes its value to fn without making an owned
 // copy. On a cache hit the slice is the cache's immutable buffer; on a miss it
 // is a pooled read buffer. fn must not retain or mutate the slice. When an
@@ -823,11 +885,13 @@ func (db *DB) BatchDelete(keys [][]byte) error {
 	}
 
 	idx := db.index.Load()
+	db.readViewMu.Lock()
 	for i := range keys {
 		idx.DeleteIfStale(keys[i], offsets[i])
 		db.cache.Delete(keys[i])
 	}
 	db.invalidateOrderedKeys(keys...)
+	db.readViewMu.Unlock()
 	return nil
 }
 
@@ -881,7 +945,10 @@ func (db *DB) BatchSet(entries []KV) error {
 		return err
 	}
 	// Metrics and index only after the batch write succeeds.
+	// Publication runs under readViewMu's write lock so readers see the whole
+	// batch or none of it.
 	idx := db.index.Load()
+	db.readViewMu.Lock()
 	for i := range entries {
 		db.metrics.Add(entries[i].Key)
 		idx.SetIfNewer(entries[i].Key, offsets[i])
@@ -892,6 +959,7 @@ func (db *DB) BatchSet(entries []KV) error {
 		batchKeys[i] = entries[i].Key
 	}
 	db.invalidateOrderedKeys(batchKeys...)
+	db.readViewMu.Unlock()
 	return nil
 }
 

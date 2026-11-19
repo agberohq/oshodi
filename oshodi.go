@@ -438,6 +438,32 @@ func (b *Bucket) Has(key []byte) bool {
 	return err == nil
 }
 
+// GetMany reads several keys under one consistent view: every returned value
+// comes from the same generation, and a concurrent BatchSet or BatchDelete is
+// either entirely visible or entirely invisible. Keys that do not exist are
+// omitted. Values are owned copies.
+func (b *Bucket) GetMany(keys [][]byte) ([]KV, error) {
+	if b.db.closed.Load() {
+		return nil, ErrClosed
+	}
+	namespaced := make([][]byte, len(keys))
+	for i, k := range keys {
+		namespaced[i] = b.inner.MakeKey(k)
+	}
+	got, err := b.db.inner.GetMany(namespaced)
+	if err != nil {
+		if errors.Is(err, engine.ErrDBClosed) {
+			return nil, ErrClosed
+		}
+		return nil, err
+	}
+	out := make([]KV, len(got))
+	for i := range got {
+		out[i] = KV{Key: b.inner.ParseKey(got[i].Key), Value: got[i].Value}
+	}
+	return out, nil
+}
+
 // GetAll returns all key-value pairs in the bucket
 func (b *Bucket) GetAll() ([]KV, error) {
 	if b.db.closed.Load() {

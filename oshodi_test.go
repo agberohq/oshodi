@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1207,5 +1208,96 @@ func TestOrderedScansAcrossBuckets(t *testing.T) {
 	}
 	if got := keys(b); len(got) != 3 || got[2] != "b2" {
 		t.Fatalf("bucket b after compact = %v", got)
+	}
+}
+
+// TestGetManySeesWholeBatch verifies that a multi-key read never observes half
+// of an atomic BatchSet. The writer keeps two keys equal; the reader must never
+// see them differ.
+func TestGetManySeesWholeBatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := Open(filepath.Join(tmpDir, "batch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	b := mustBucket(t, db, "b")
+	k1, k2 := []byte("a"), []byte("b")
+	val := func(n int) []byte { return []byte(strconv.Itoa(n)) }
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for n := 1; !stop.Load(); n++ {
+			if err := b.BatchSet([]KV{{Key: k1, Value: val(n)}, {Key: k2, Value: val(n)}}); err != nil {
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var reads, torn int
+	var lastA, lastB string
+	for time.Now().Before(deadline) {
+		got, gerr := b.GetMany([][]byte{k1, k2, []byte("missing")})
+		if gerr != nil {
+			break
+		}
+		if len(got) == 0 {
+			continue // nothing published yet
+		}
+		if len(got) != 2 {
+			torn++
+			break
+		}
+		byKey := map[string]string{}
+		for _, kv := range got {
+			byKey[string(kv.Key)] = string(kv.Value)
+		}
+		lastA, lastB = byKey["a"], byKey["b"]
+		if lastA != lastB {
+			torn++
+			break
+		}
+		reads++
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if torn != 0 {
+		t.Fatalf("observed a partially published batch (or a missing key): a=%q b=%q", lastA, lastB)
+	}
+	if reads == 0 {
+		t.Fatal("no reads observed")
+	}
+}
+
+// TestGetManyValuesAreOwned checks the result does not alias internal buffers.
+func TestGetManyValuesAreOwned(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := Open(filepath.Join(tmpDir, "owned.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	b := mustBucket(t, db, "b")
+	if err := b.Set([]byte("k"), []byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.GetMany([][]byte{[]byte("k")})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("get many: %v %d", err, len(got))
+	}
+	got[0].Value[0] = 'X'
+	again, err := b.Get([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != "original" {
+		t.Fatalf("stored value changed through the returned slice: %q", again)
 	}
 }
