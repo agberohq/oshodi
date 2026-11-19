@@ -228,10 +228,10 @@ func (bs *BucketSnapshot) GetMany(keys [][]byte) ([]KV, error) {
 
 // ScanRange iterates the keys in [start, end) as of the view, in key order.
 //
-// It resolves each candidate key through the snapshot, so it costs one index
-// read per key in the index (plus one history walk per overwritten key). The
-// scan is bounded by the bucket and the key range, not by the number of
-// versions.
+// Candidates come from the ordered index plus the displaced-version history,
+// which still holds keys overwritten or deleted since the view was taken. Each
+// candidate is resolved through the snapshot, so a key only reaches the
+// callback if it existed at the watermark.
 func (bs *BucketSnapshot) ScanRange(start, end []byte, fn func(key, value []byte) bool) error {
 	prefix := string(bs.bucket.prefix)
 	lo := prefix + string(start)
@@ -240,20 +240,25 @@ func (bs *BucketSnapshot) ScanRange(start, end []byte, fn func(key, value []byte
 		hi = prefix + string(end)
 	}
 
+	seen := make(map[string]struct{}, 64)
 	var keys []string
-	bs.snap.db.index.Load().RangeRaw(func(k string, _ int64) bool {
-		if !strings.HasPrefix(k, prefix) {
-			return true
+	add := func(k string) {
+		if _, ok := seen[k]; ok {
+			return
 		}
-		if k < lo {
-			return true
-		}
-		if hi != "" && k >= hi {
-			return true
-		}
+		seen[k] = struct{}{}
 		keys = append(keys, k)
+	}
+
+	if err := bs.bucket.scanOrderedKeys(start, end, false, func(_ []byte, k string) bool {
+		add(k)
 		return true
-	})
+	}); err != nil {
+		return err
+	}
+	for _, k := range bs.snap.db.history.keysInRange(prefix, lo, hi) {
+		add(k)
+	}
 	sort.Strings(keys)
 
 	for _, k := range keys {

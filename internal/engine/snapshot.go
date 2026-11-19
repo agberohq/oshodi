@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -139,6 +140,21 @@ func (h *keyHistory) lookup(key string) []int64 {
 		copy(out, entries)
 	}
 	h.mu.Unlock()
+	return out
+}
+
+// keysInRange returns the history keys under prefix p in [lo, hi): keys that
+// were overwritten or deleted, which the ordered index no longer lists.
+func (h *keyHistory) keysInRange(p, lo, hi string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for k := range h.byKey {
+		if !strings.HasPrefix(k, p) || k < lo || (hi != "" && k >= hi) {
+			continue
+		}
+		out = append(out, k)
+	}
 	return out
 }
 
